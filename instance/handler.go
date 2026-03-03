@@ -48,17 +48,29 @@ func CompletionsHandler(c *gin.Context, state *config.State) {
 		c.Header("Content-Type", "text/event-stream")
 		c.Header("Cache-Control", "no-cache")
 		c.Header("Connection", "keep-alive")
+		c.Header("X-Accel-Buffering", "no")
 		c.Status(resp.StatusCode)
 
-		// Pipe upstream SSE directly to client
-		reader := bufio.NewReader(resp.Body)
+		// Pipe upstream SSE directly to client with large buffer
+		reader := bufio.NewReaderSize(resp.Body, 10*1024*1024) // 10MB buffer
 		c.Stream(func(w io.Writer) bool {
 			line, err := reader.ReadBytes('\n')
+			if len(line) > 0 {
+				if _, writeErr := w.Write(line); writeErr != nil {
+					return false
+				}
+				// Flush after each line to prevent buffering delays
+				if flusher, ok := w.(http.Flusher); ok {
+					flusher.Flush()
+				}
+			}
 			if err != nil {
+				if err != io.EOF {
+					log.Printf("Stream read error: %v", err)
+				}
 				return false
 			}
-			_, writeErr := w.Write(line)
-			return writeErr == nil
+			return true
 		})
 	} else {
 		// Non-streaming: read full response and forward
@@ -200,12 +212,13 @@ func handleAnthropicStream(c *gin.Context, resp *http.Response) {
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
 	c.Status(http.StatusOK)
 
 	state := anthropic.NewStreamState()
+	// Use a large buffer (10MB) to handle long context SSE chunks
 	scanner := bufio.NewScanner(resp.Body)
-	// Increase buffer size for large chunks
-	scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024)
+	scanner.Buffer(make([]byte, 0, 10*1024*1024), 10*1024*1024)
 
 	c.Stream(func(w io.Writer) bool {
 		for scanner.Scan() {
@@ -219,6 +232,10 @@ func handleAnthropicStream(c *gin.Context, resp *http.Response) {
 			if data == "[DONE]" {
 				// Send message_stop
 				writeSSE(w, "message_stop", map[string]string{"type": "message_stop"})
+				// Flush final event
+				if flusher, ok := w.(http.Flusher); ok {
+					flusher.Flush()
+				}
 				return false
 			}
 
@@ -231,6 +248,25 @@ func handleAnthropicStream(c *gin.Context, resp *http.Response) {
 			events := anthropic.TranslateChunkToAnthropicEvents(chunk, state)
 			for _, event := range events {
 				writeSSE(w, event.Event, event.Data)
+			}
+			// Flush after each batch of events to prevent buffering
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+		}
+		// Check for scanner errors (e.g., buffer overflow, read errors)
+		if err := scanner.Err(); err != nil {
+			log.Printf("Anthropic stream scanner error: %v", err)
+			// Send an error event to the client so it knows something went wrong
+			writeSSE(w, "error", map[string]interface{}{
+				"type": "error",
+				"error": map[string]string{
+					"type":    "stream_error",
+					"message": fmt.Sprintf("upstream stream error: %v", err),
+				},
+			})
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
 			}
 		}
 		return false

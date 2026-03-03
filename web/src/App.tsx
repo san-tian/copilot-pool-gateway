@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react"
 
-import { api, getSessionToken, setSessionToken, type Account, type BatchUsageItem, type ModelMapping, type PoolConfig } from "./api"
+import { api, getSessionToken, setSessionToken, type Account, type BatchUsageItem, type CopilotModel, type ModelMapping, type PoolConfig } from "./api"
 import { AccountCard } from "./components/AccountCard"
 import { AddAccountForm } from "./components/AddAccountForm"
 import { useLocale, useT } from "./i18n"
@@ -169,7 +169,14 @@ function usageColor(pct: number): string {
   return "var(--green)"
 }
 
-function UsageCell({ used, total }: { used: number; total: number }) {
+function UsageCell({ used, total, unlimited }: { used: number; total: number; unlimited?: boolean }) {
+  if (unlimited) {
+    return (
+      <td style={{ padding: "8px 10px", fontSize: 12, fontFamily: "monospace" }}>
+        <span style={{ color: "var(--green)" }}>∞</span>
+      </td>
+    )
+  }
   const pct = total > 0 ? (used / total) * 100 : 0
   return (
     <td style={{ padding: "8px 10px", fontSize: 12, fontFamily: "monospace" }}>
@@ -193,19 +200,31 @@ function BatchUsagePanel() {
     finally { setLoading(false) }
   }
 
-  const runningItems = items.filter((i) => i.usage)
+  const runningItems = items.filter((i) => i.usage?.quota_snapshots)
   const totals = runningItems.reduce(
     (acc, i) => {
       const q = i.usage!.quota_snapshots
-      acc.premiumUsed += q.premium_interactions.entitlement - q.premium_interactions.remaining
-      acc.premiumTotal += q.premium_interactions.entitlement
-      acc.chatUsed += q.chat.entitlement - q.chat.remaining
-      acc.chatTotal += q.chat.entitlement
-      acc.compUsed += q.completions.entitlement - q.completions.remaining
-      acc.compTotal += q.completions.entitlement
+      if (!q.premium_interactions?.unlimited) {
+        acc.premiumUsed += (q.premium_interactions?.entitlement ?? 0) - (q.premium_interactions?.remaining ?? 0)
+        acc.premiumTotal += q.premium_interactions?.entitlement ?? 0
+      } else {
+        acc.premiumUnlimited = true
+      }
+      if (!q.chat?.unlimited) {
+        acc.chatUsed += (q.chat?.entitlement ?? 0) - (q.chat?.remaining ?? 0)
+        acc.chatTotal += q.chat?.entitlement ?? 0
+      } else {
+        acc.chatUnlimited = true
+      }
+      if (!q.completions?.unlimited) {
+        acc.compUsed += (q.completions?.entitlement ?? 0) - (q.completions?.remaining ?? 0)
+        acc.compTotal += q.completions?.entitlement ?? 0
+      } else {
+        acc.compUnlimited = true
+      }
       return acc
     },
-    { premiumUsed: 0, premiumTotal: 0, chatUsed: 0, chatTotal: 0, compUsed: 0, compTotal: 0 },
+    { premiumUsed: 0, premiumTotal: 0, premiumUnlimited: false, chatUsed: 0, chatTotal: 0, chatUnlimited: false, compUsed: 0, compTotal: 0, compUnlimited: false },
   )
 
   const thStyle: React.CSSProperties = { padding: "8px 10px", textAlign: "left", fontSize: 12, fontWeight: 600, color: "var(--text-muted)", borderBottom: "1px solid var(--border)" }
@@ -237,18 +256,18 @@ function BatchUsagePanel() {
                     <tr key={item.accountId} style={{ borderBottom: "1px solid var(--border)" }}>
                       <td style={{ padding: "8px 10px", fontSize: 13, fontWeight: 500 }}>{item.name}</td>
                       <td style={{ padding: "8px 10px", fontSize: 12, color: "var(--text-muted)" }}>{item.usage!.copilot_plan}</td>
-                      <UsageCell used={q.premium_interactions.entitlement - q.premium_interactions.remaining} total={q.premium_interactions.entitlement} />
-                      <UsageCell used={q.chat.entitlement - q.chat.remaining} total={q.chat.entitlement} />
-                      <UsageCell used={q.completions.entitlement - q.completions.remaining} total={q.completions.entitlement} />
+                      <UsageCell used={(q.premium_interactions?.entitlement ?? 0) - (q.premium_interactions?.remaining ?? 0)} total={q.premium_interactions?.entitlement ?? 0} unlimited={q.premium_interactions?.unlimited} />
+                      <UsageCell used={(q.chat?.entitlement ?? 0) - (q.chat?.remaining ?? 0)} total={q.chat?.entitlement ?? 0} unlimited={q.chat?.unlimited} />
+                      <UsageCell used={(q.completions?.entitlement ?? 0) - (q.completions?.remaining ?? 0)} total={q.completions?.entitlement ?? 0} unlimited={q.completions?.unlimited} />
                       <td style={{ padding: "8px 10px", fontSize: 12, color: "var(--text-muted)" }}>{item.usage!.quota_reset_date}</td>
                     </tr>
                   )
                 })}
                 <tr style={{ fontWeight: 600, borderTop: "2px solid var(--border)" }}>
                   <td style={{ padding: "8px 10px", fontSize: 13 }}>{t("totalSummary")}</td><td />
-                  <UsageCell used={totals.premiumUsed} total={totals.premiumTotal} />
-                  <UsageCell used={totals.chatUsed} total={totals.chatTotal} />
-                  <UsageCell used={totals.compUsed} total={totals.compTotal} />
+                  <UsageCell used={totals.premiumUsed} total={totals.premiumTotal} unlimited={totals.premiumUnlimited} />
+                  <UsageCell used={totals.chatUsed} total={totals.chatTotal} unlimited={totals.chatUnlimited} />
+                  <UsageCell used={totals.compUsed} total={totals.compTotal} unlimited={totals.compUnlimited} />
                   <td />
                 </tr>
               </tbody>
@@ -266,6 +285,9 @@ function ModelMappingPanel() {
   const [saving, setSaving] = useState(false)
   const [open, setOpen] = useState(false)
   const [fetched, setFetched] = useState(false)
+  const [copilotModels, setCopilotModels] = useState<Array<CopilotModel>>([])
+  const [fetchingModels, setFetchingModels] = useState(false)
+  const [modelsFetched, setModelsFetched] = useState(false)
   const t = useT()
 
   const fetchMappings = async () => {
@@ -285,8 +307,28 @@ function ModelMappingPanel() {
       const valid = mappings.filter(m => m.copilotId && m.displayId)
       const data = await api.setModelMappings(valid)
       setMappings(data.mappings ?? [])
+      // Refresh copilot models mapping status after saving
+      if (modelsFetched) {
+        void fetchCopilotModels()
+      }
     } catch (err) { console.error("Failed to save model mappings:", err) }
     finally { setSaving(false) }
+  }
+
+  const fetchCopilotModels = async () => {
+    setFetchingModels(true)
+    try {
+      const data = await api.getCopilotModels()
+      setCopilotModels(data.models ?? [])
+      setModelsFetched(true)
+    } catch (err) { console.error("Failed to fetch copilot models:", err) }
+    finally { setFetchingModels(false) }
+  }
+
+  const quickAddModel = (model: CopilotModel) => {
+    // Don't add if already in the mappings list
+    if (mappings.some(m => m.copilotId === model.id)) return
+    setMappings([...mappings, { copilotId: model.id, displayId: "", displayName: "" }])
   }
 
   const addRow = () => setMappings([...mappings, { copilotId: "", displayId: "", displayName: "" }])
@@ -296,6 +338,8 @@ function ModelMappingPanel() {
     updated[idx] = { ...updated[idx], [field]: value }
     setMappings(updated)
   }
+
+  const thStyle: React.CSSProperties = { padding: "6px 10px", textAlign: "left", fontSize: 12, fontWeight: 600, color: "var(--text-muted)", borderBottom: "1px solid var(--border)" }
 
   return (
     <div style={{ background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: 16, marginBottom: 16 }}>
@@ -311,6 +355,53 @@ function ModelMappingPanel() {
       </div>
       {open && fetched && (
         <div style={{ marginTop: 12 }}>
+          {/* Copilot Models Section */}
+          <div style={{ marginBottom: 16, padding: 12, background: "var(--bg)", borderRadius: "var(--radius)" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+              <span style={{ fontSize: 13, fontWeight: 600 }}>{t("copilotModels")}</span>
+              <button onClick={() => void fetchCopilotModels()} disabled={fetchingModels} style={{ fontSize: 12, padding: "4px 12px" }}>
+                {fetchingModels ? t("fetchingModels") : t("fetchModels")}
+              </button>
+            </div>
+            {modelsFetched && (
+              copilotModels.length === 0 ? (
+                <div style={{ color: "var(--text-muted)", fontSize: 12, textAlign: "center", padding: 8 }}>{t("noRunningInstances")}</div>
+              ) : (
+                <div style={{ overflowX: "auto" }}>
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                    <thead><tr>
+                      <th style={thStyle}>ID</th>
+                      <th style={thStyle}>Owner</th>
+                      <th style={thStyle}>{t("modelStatus")}</th>
+                      <th style={{ ...thStyle, textAlign: "right" }} />
+                    </tr></thead>
+                    <tbody>
+                      {copilotModels.map((m) => (
+                        <tr key={m.id} style={{ borderBottom: "1px solid var(--border)" }}>
+                          <td style={{ padding: "6px 10px", fontSize: 12, fontFamily: "monospace" }}>{m.id}</td>
+                          <td style={{ padding: "6px 10px", fontSize: 12, color: "var(--text-muted)" }}>{m.ownedBy}</td>
+                          <td style={{ padding: "6px 10px", fontSize: 12 }}>
+                            {m.mapped ? (
+                              <span style={{ color: "var(--green)" }}>{t("mapped")} → <span style={{ fontFamily: "monospace" }}>{m.displayId}</span></span>
+                            ) : (
+                              <span style={{ color: "var(--yellow, #e5a00d)" }}>{t("unmapped")}</span>
+                            )}
+                          </td>
+                          <td style={{ padding: "6px 10px", textAlign: "right" }}>
+                            {!m.mapped && !mappings.some(mm => mm.copilotId === m.id) && (
+                              <button onClick={() => quickAddModel(m)} style={{ fontSize: 11, padding: "2px 8px" }}>{t("quickAdd")}</button>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )
+            )}
+          </div>
+
+          {/* Mapping Editor */}
           {mappings.length === 0 ? (
             <div style={{ color: "var(--text-muted)", fontSize: 13, padding: 16, textAlign: "center" }}>
               {t("noMappings")}<br /><span style={{ fontSize: 12 }}>{t("noMappingsHint")}</span>

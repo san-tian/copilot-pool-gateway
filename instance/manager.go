@@ -15,11 +15,11 @@ import (
 )
 
 type ProxyInstance struct {
-	Account     store.Account
-	State       *config.State
-	Status      string // "running", "stopped", "error"
-	Error       string
-	stopChan    chan struct{}
+	Account  store.Account
+	State    *config.State
+	Status   string // "running", "stopped", "error"
+	Error    string
+	stopChan chan struct{}
 }
 
 type CopilotUser struct {
@@ -140,6 +140,33 @@ func GetAllInstances() map[string]*ProxyInstance {
 	result := make(map[string]*ProxyInstance)
 	for k, v := range instances {
 		result[k] = v
+	}
+	return result
+}
+
+// GetAllCachedModels collects and deduplicates model entries from all running instances.
+func GetAllCachedModels() []config.ModelEntry {
+	mu.RLock()
+	defer mu.RUnlock()
+
+	seen := make(map[string]bool)
+	var result []config.ModelEntry
+	for _, inst := range instances {
+		if inst.Status != "running" {
+			continue
+		}
+		inst.State.RLock()
+		models := inst.State.Models
+		inst.State.RUnlock()
+		if models == nil {
+			continue
+		}
+		for _, m := range models.Data {
+			if !seen[m.ID] {
+				seen[m.ID] = true
+				result = append(result, m)
+			}
+		}
 	}
 	return result
 }
@@ -277,6 +304,22 @@ func fetchModels(state *config.State) error {
 	return nil
 }
 
+// streamingHTTPClient is a shared client for streaming requests.
+// It has NO overall timeout — streaming responses can last indefinitely.
+// Connection-level timeouts are handled by the transport.
+var streamingHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		ResponseHeaderTimeout: 2 * time.Minute, // max wait for first response header
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	},
+	// No Timeout set — this is critical for streaming.
+	// http.Client.Timeout applies to the ENTIRE request lifecycle including
+	// reading the response body. For streaming SSE, the body is read over
+	// minutes/hours, so any finite timeout here will kill long conversations.
+}
+
 func ProxyRequest(state *config.State, method, path string, body io.Reader, extraHeaders http.Header) (*http.Response, error) {
 	state.RLock()
 	baseURL := config.CopilotBaseURL(state.AccountType)
@@ -302,8 +345,7 @@ func ProxyRequest(state *config.State, method, path string, body io.Reader, extr
 		req.Header[k] = v
 	}
 
-	client := &http.Client{Timeout: 5 * time.Minute}
-	return client.Do(req)
+	return streamingHTTPClient.Do(req)
 }
 
 func ProxyRequestWithBytes(state *config.State, method, path string, bodyBytes []byte, extraHeaders http.Header, hasVision bool) (*http.Response, error) {
@@ -325,6 +367,5 @@ func ProxyRequestWithBytes(state *config.State, method, path string, bodyBytes [
 		req.Header[k] = v
 	}
 
-	client := &http.Client{Timeout: 5 * time.Minute}
-	return client.Do(req)
+	return streamingHTTPClient.Do(req)
 }

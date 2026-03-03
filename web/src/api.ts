@@ -46,6 +46,7 @@ interface QuotaDetail {
   entitlement: number
   remaining: number
   percent_remaining: number
+  unlimited?: boolean
 }
 
 export interface PoolConfig {
@@ -83,6 +84,13 @@ export interface ModelMapping {
   copilotId: string
   displayId: string
   displayName?: string
+}
+
+export interface CopilotModel {
+  id: string
+  ownedBy: string
+  mapped: boolean
+  displayId: string
 }
 
 interface ErrorBody {
@@ -194,4 +202,7 @@ export const api = {
     request<{ success: boolean }>(`/model-map/${encodeURIComponent(copilotId)}`, {
       method: "DELETE",
     }),
+
+  getCopilotModels: () =>
+    request<{ models: Array<CopilotModel> }>("/copilot-models"),
 }

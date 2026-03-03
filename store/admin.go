@@ -2,6 +2,7 @@ package store
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"sync"
 	"time"
@@ -11,6 +12,7 @@ import (
 )
 
 type AdminData struct {
+	Username     string `json:"username"`
 	PasswordHash string `json:"passwordHash"`
 }
 
@@ -20,10 +22,10 @@ type AdminSession struct {
 }
 
 var (
-	adminMu      sync.RWMutex
-	sessionsMu   sync.RWMutex
-	sessions     = make(map[string]*AdminSession)
-	sessionTTL   = 7 * 24 * time.Hour
+	adminMu    sync.RWMutex
+	sessionsMu sync.RWMutex
+	sessions   = make(map[string]*AdminSession)
+	sessionTTL = 7 * 24 * time.Hour
 )
 
 func IsSetupRequired() (bool, error) {
@@ -44,7 +46,7 @@ func IsSetupRequired() (bool, error) {
 	return admin.PasswordHash == "", nil
 }
 
-func SetupAdmin(password string) error {
+func SetupAdmin(username, password string) error {
 	adminMu.Lock()
 	defer adminMu.Unlock()
 
@@ -53,7 +55,7 @@ func SetupAdmin(password string) error {
 		return err
 	}
 
-	admin := AdminData{PasswordHash: string(hash)}
+	admin := AdminData{Username: username, PasswordHash: string(hash)}
 	data, err := json.MarshalIndent(admin, "", "  ")
 	if err != nil {
 		return err
@@ -61,7 +63,7 @@ func SetupAdmin(password string) error {
 	return os.WriteFile(AdminFile(), data, 0644)
 }
 
-func LoginAdmin(password string) (string, error) {
+func LoginAdmin(username, password string) (string, error) {
 	adminMu.RLock()
 	defer adminMu.RUnlock()
 
@@ -72,6 +74,10 @@ func LoginAdmin(password string) (string, error) {
 	var admin AdminData
 	if err := json.Unmarshal(data, &admin); err != nil {
 		return "", err
+	}
+
+	if admin.Username != username {
+		return "", fmt.Errorf("invalid credentials")
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(admin.PasswordHash), []byte(password)); err != nil {

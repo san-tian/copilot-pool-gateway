@@ -15,6 +15,7 @@ import (
 	"copilot-go/store"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 // RegisterConsoleAPI registers all Web Console management API routes.
@@ -81,6 +82,9 @@ func RegisterConsoleAPI(r *gin.Engine, proxyPort int) {
 	protected.PUT("/model-map", handleSetModelMap)
 	protected.POST("/model-map", handleAddModelMapping)
 	protected.DELETE("/model-map/:copilotId", handleDeleteModelMapping)
+
+	// Copilot models
+	protected.GET("/copilot-models", handleGetCopilotModels)
 }
 
 func adminAuthMiddleware() gin.HandlerFunc {
@@ -104,10 +108,11 @@ func adminAuthMiddleware() gin.HandlerFunc {
 
 func handleSetup(c *gin.Context) {
 	var body struct {
+		Username string `json:"username"`
 		Password string `json:"password"`
 	}
-	if err := c.ShouldBindJSON(&body); err != nil || body.Password == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "password is required"})
+	if err := c.ShouldBindJSON(&body); err != nil || body.Password == "" || body.Username == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "username and password are required"})
 		return
 	}
 
@@ -117,12 +122,12 @@ func handleSetup(c *gin.Context) {
 		return
 	}
 
-	if err := store.SetupAdmin(body.Password); err != nil {
+	if err := store.SetupAdmin(body.Username, body.Password); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
-	token, err := store.LoginAdmin(body.Password)
+	token, err := store.LoginAdmin(body.Username, body.Password)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -133,16 +138,17 @@ func handleSetup(c *gin.Context) {
 
 func handleLogin(c *gin.Context) {
 	var body struct {
+		Username string `json:"username"`
 		Password string `json:"password"`
 	}
-	if err := c.ShouldBindJSON(&body); err != nil || body.Password == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "password is required"})
+	if err := c.ShouldBindJSON(&body); err != nil || body.Password == "" || body.Username == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "username and password are required"})
 		return
 	}
 
-	token, err := store.LoginAdmin(body.Password)
+	token, err := store.LoginAdmin(body.Username, body.Password)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid password"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid username or password"})
 		return
 	}
 
@@ -375,7 +381,7 @@ func handleCompleteAuth(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "session not found"})
 		return
 	}
-	if session.Status != "complete" || session.AccessToken == "" {
+	if session.Status != "completed" || session.AccessToken == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "auth not completed"})
 		return
 	}
@@ -409,28 +415,59 @@ func handleGetPool(c *gin.Context) {
 }
 
 func handleUpdatePool(c *gin.Context) {
-	var cfg store.PoolConfig
-	if err := c.ShouldBindJSON(&cfg); err != nil {
+	var updates map[string]interface{}
+	if err := c.ShouldBindJSON(&updates); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
 		return
 	}
-	if cfg.Strategy == "" {
-		cfg.Strategy = "round-robin"
-	}
-	if err := store.UpdatePoolConfig(&cfg); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, cfg)
-}
 
-func handleRegeneratePoolKey(c *gin.Context) {
-	newKey, err := store.RegeneratePoolApiKey()
+	// Read existing config first, then merge updates
+	existing, err := store.GetPoolConfig()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"apiKey": newKey})
+
+	if v, ok := updates["enabled"]; ok {
+		if b, ok := v.(bool); ok {
+			existing.Enabled = b
+		}
+	}
+	if v, ok := updates["strategy"]; ok {
+		if s, ok := v.(string); ok && s != "" {
+			existing.Strategy = s
+		}
+	}
+
+	// Generate a key if pool is being enabled and has no key yet
+	if existing.Enabled && existing.ApiKey == "" {
+		existing.ApiKey = "sk-pool-" + uuid.New().String()
+	}
+
+	if existing.Strategy == "" {
+		existing.Strategy = "round-robin"
+	}
+
+	if err := store.UpdatePoolConfig(existing); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, existing)
+}
+
+func handleRegeneratePoolKey(c *gin.Context) {
+	_, err := store.RegeneratePoolApiKey()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	// Return the full config so frontend gets the complete PoolConfig object
+	cfg, err := store.GetPoolConfig()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, cfg)
 }
 
 // --- Model map handlers ---
@@ -481,6 +518,41 @@ func handleDeleteModelMapping(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
+// --- Copilot models handler ---
+
+func handleGetCopilotModels(c *gin.Context) {
+	models := instance.GetAllCachedModels()
+	mappings, _ := store.GetModelMappings()
+
+	// Build a lookup from copilotId -> displayId
+	mappingLookup := make(map[string]string)
+	for _, m := range mappings {
+		mappingLookup[m.CopilotID] = m.DisplayID
+	}
+
+	type copilotModelItem struct {
+		ID        string `json:"id"`
+		OwnedBy   string `json:"ownedBy"`
+		Mapped    bool   `json:"mapped"`
+		DisplayID string `json:"displayId"`
+	}
+
+	result := make([]copilotModelItem, 0, len(models))
+	for _, m := range models {
+		item := copilotModelItem{
+			ID:      m.ID,
+			OwnedBy: m.OwnedBy,
+		}
+		if did, ok := mappingLookup[m.ID]; ok {
+			item.Mapped = true
+			item.DisplayID = did
+		}
+		result = append(result, item)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"models": result})
+}
+
 // findWebDist locates the web/dist directory relative to the executable or working directory.
 func findWebDist() string {
 	// Try relative to working directory
@@ -507,7 +579,7 @@ func fetchCopilotUsage(accountID string) (interface{}, error) {
 		return nil, fmt.Errorf("instance not running")
 	}
 
-	req, err := http.NewRequest("GET", "https://api.github.com/copilot_internal/v2/token", nil)
+	req, err := http.NewRequest("GET", "https://api.github.com/copilot_internal/user", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -522,23 +594,12 @@ func fetchCopilotUsage(accountID string) (interface{}, error) {
 	}
 	defer resp.Body.Close()
 
-	// Try to get usage from the copilot billing endpoint
-	usageReq, err := http.NewRequest("GET", "https://api.github.com/copilot_internal/user/usage", nil)
-	if err != nil {
-		return nil, err
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("copilot user API returned status %d", resp.StatusCode)
 	}
-	for k, v := range config.GithubHeaders(state) {
-		usageReq.Header[k] = v
-	}
-
-	usageResp, err := client.Do(usageReq)
-	if err != nil {
-		return nil, err
-	}
-	defer usageResp.Body.Close()
 
 	var usage interface{}
-	if err := json.NewDecoder(usageResp.Body).Decode(&usage); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&usage); err != nil {
 		return nil, err
 	}
 	return usage, nil

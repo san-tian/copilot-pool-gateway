@@ -116,6 +116,16 @@ const en = {
   modelMappingPlaceholder: "e.g. gpt-4o",
   displayIdPlaceholder: "e.g. gpt-4o-standard",
   displayNamePlaceholder: "optional display name",
+
+  // Copilot Models
+  fetchModels: "Fetch Models",
+  copilotModels: "Copilot Models",
+  modelStatus: "Status",
+  mapped: "Mapped",
+  unmapped: "Unmapped",
+  quickAdd: "Quick Add",
+  noRunningInstances: "No running instances. Start an account first.",
+  fetchingModels: "Fetching...",
 } as const
 
 export type TranslationKey = keyof typeof en
@@ -233,6 +243,16 @@ const zh: Translations = {
   modelMappingPlaceholder: "例如 gpt-4o",
   displayIdPlaceholder: "例如 gpt-4o-standard",
   displayNamePlaceholder: "可选显示名称",
+
+  // Copilot Models
+  fetchModels: "获取模型列表",
+  copilotModels: "Copilot 官方模型",
+  modelStatus: "映射状态",
+  mapped: "已映射",
+  unmapped: "未映射",
+  quickAdd: "快速添加",
+  noRunningInstances: "无运行中的账号实例，请先启动账号",
+  fetchingModels: "获取中...",
 } as const
 
 interface I18nContextValue {
