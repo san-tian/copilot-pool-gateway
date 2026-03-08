@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -607,6 +608,12 @@ func handleUpdateProxyConfig(c *gin.Context) {
 	if err := c.ShouldBindJSON(&cfg); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
 		return
+	}
+	if cfg.ProxyURL != "" {
+		if _, err := url.ParseRequestURI(cfg.ProxyURL); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid proxy URL"})
+			return
+		}
 	}
 	if err := store.UpdateProxyConfig(cfg); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})

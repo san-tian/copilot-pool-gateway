@@ -134,6 +134,10 @@ function ProxySettingsPanel({ settings, onChange }: { settings: ProxySettings; o
   const [saved, setSaved] = useState(false)
   const t = useT()
 
+  useEffect(() => {
+    setInput(settings.proxyURL ?? "")
+  }, [settings.proxyURL])
+
   const save = async (url: string) => {
     setSaving(true)
     try {
@@ -147,7 +151,7 @@ function ProxySettingsPanel({ settings, onChange }: { settings: ProxySettings; o
   }
 
   const handleBlur = () => {
-    if (input !== settings.proxyURL) void save(input)
+    if (!saving && input !== settings.proxyURL) void save(input)
   }
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
