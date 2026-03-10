@@ -1,0 +1,19 @@
+services:
+  copilot-go:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: copilot-go
+    restart: unless-stopped
+    ports:
+      - "3000:3000"   # Web Console
+      - "4141:4141"   # Proxy
+    volumes:
+      - copilot-data:/root/.local/share/copilot-api
+    environment:
+      - TZ=Asia/Shanghai
+    command: ["./copilot-go", "--web-port=3000", "--proxy-port=4141"]
+
+volumes:
+  copilot-data:
+    driver: local
