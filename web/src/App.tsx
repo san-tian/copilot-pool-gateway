@@ -454,6 +454,232 @@ function ProxyUsagePanel({ accounts }: { accounts: Array<Account> }) {
   )
 }
 
+function ClaudeCodePanel({ accounts, proxyPort, pool }: { accounts: Array<Account>; proxyPort: number; pool: PoolConfig }) {
+  const [open, setOpen] = useState(false)
+  const [model, setModel] = useState("claude-sonnet-4")
+  const [smallModel, setSmallModel] = useState("claude-sonnet-4")
+  const [customModel, setCustomModel] = useState("")
+  const [customSmallModel, setCustomSmallModel] = useState("")
+  const [selectedKeySource, setSelectedKeySource] = useState("")  // "pool" or account id
+  const [shell, setShell] = useState<"bash" | "powershell" | "cmd">("bash")
+  const [command, setCommand] = useState("")
+  const [loading, setLoading] = useState(false)
+  const [copied, setCopied] = useState(false)
+  const [modelOptions, setModelOptions] = useState<string[]>([])
+  const [modelsFetched, setModelsFetched] = useState(false)
+  const t = useT()
+
+  const runningAccounts = accounts.filter((a) => a.status === "running")
+  const hasPoolKey = pool.enabled && !!pool.apiKey
+  const hasAnyKey = runningAccounts.length > 0 || hasPoolKey
+
+  // Fetch model options from mappings + copilot models on open
+  useEffect(() => {
+    if (!open || modelsFetched) return
+    void (async () => {
+      const ids = new Set<string>()
+      try {
+        const mappingData = await api.getModelMappings()
+        for (const m of mappingData.mappings ?? []) {
+          if (m.displayId) ids.add(m.displayId)
+        }
+      } catch { /* ignore */ }
+      try {
+        const copilotData = await api.getCopilotModels()
+        for (const m of copilotData.models ?? []) {
+          ids.add(m.id)
+          if (m.displayId) ids.add(m.displayId)
+        }
+      } catch { /* ignore */ }
+      setModelOptions([...ids].sort())
+      setModelsFetched(true)
+    })()
+  }, [open, modelsFetched])
+
+  const resolveApiKey = (): string | null => {
+    if (selectedKeySource === "pool") return pool.apiKey
+    const account = runningAccounts.find((a) => a.id === selectedKeySource)
+    return account?.apiKey ?? null
+  }
+
+  const resolveModel = (sel: string, custom: string) => sel === "__custom__" ? custom : sel
+
+  const generate = async () => {
+    const apiKey = resolveApiKey()
+    if (!apiKey) return
+    setLoading(true)
+    try {
+      const result = await api.generateClaudeCodeCommand({
+        model: resolveModel(model, customModel),
+        smallModel: resolveModel(smallModel, customSmallModel),
+        apiKey,
+      })
+      setCommand(result[shell])
+    } catch (err) {
+      console.error("Failed to generate command:", err)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const copyCommand = () => {
+    void navigator.clipboard.writeText(command)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 1500)
+  }
+
+  const switchShell = async (newShell: "bash" | "powershell" | "cmd") => {
+    setShell(newShell)
+    if (command && selectedKeySource) {
+      const apiKey = resolveApiKey()
+      if (!apiKey) return
+      try {
+        const result = await api.generateClaudeCodeCommand({
+          model: resolveModel(model, customModel),
+          smallModel: resolveModel(smallModel, customSmallModel),
+          apiKey,
+        })
+        setCommand(result[newShell])
+      } catch { /* ignore */ }
+    }
+  }
+
+  const canGenerate = !!selectedKeySource && resolveModel(model, customModel) !== ""
+
+  const modelSelect = (value: string, customValue: string, onSelect: (v: string) => void, onCustomChange: (v: string) => void) => (
+    <div style={{ display: "flex", flex: 1, gap: 6 }}>
+      <select
+        value={value}
+        onChange={(e) => { onSelect(e.target.value); setCommand("") }}
+        style={{ flex: 1, fontSize: 13, padding: "4px 8px", fontFamily: "monospace" }}
+      >
+        {modelOptions.map((id) => (
+          <option key={id} value={id}>{id}</option>
+        ))}
+        {!modelOptions.includes(value) && value !== "__custom__" && (
+          <option value={value}>{value}</option>
+        )}
+        <option value="__custom__">{t("claudeCodeCustomModel")}</option>
+      </select>
+      {value === "__custom__" && (
+        <input
+          type="text"
+          value={customValue}
+          onChange={(e) => { onCustomChange(e.target.value); setCommand("") }}
+          placeholder={t("claudeCodeCustomModelPlaceholder")}
+          style={{ flex: 1, fontSize: 13, padding: "4px 8px", fontFamily: "monospace" }}
+        />
+      )}
+    </div>
+  )
+
+  return (
+    <div style={{ background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: 16, marginBottom: 16 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div>
+          <div style={{ fontSize: 15, fontWeight: 600 }}>{t("claudeCode")}</div>
+          <div style={{ fontSize: 13, color: "var(--text-muted)" }}>{t("claudeCodeDesc")}</div>
+        </div>
+        <button onClick={() => setOpen(!open)}>{open ? t("hide") : t("show")}</button>
+      </div>
+      {open && (
+        <div style={{ marginTop: 12 }}>
+          {!hasAnyKey ? (
+            <div style={{ color: "var(--text-muted)", fontSize: 13, padding: 16, textAlign: "center" }}>{t("claudeCodeNoAccounts")}</div>
+          ) : (
+            <>
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
+                  <span style={{ color: "var(--text-muted)", flexShrink: 0, minWidth: 100 }}>{t("claudeCodeApiKey")}</span>
+                  <select
+                    value={selectedKeySource}
+                    onChange={(e) => { setSelectedKeySource(e.target.value); setCommand("") }}
+                    style={{ flex: 1, fontSize: 13, padding: "4px 8px" }}
+                  >
+                    <option value="">{t("claudeCodeSelectAccount")}</option>
+                    {hasPoolKey && (
+                      <option value="pool">{t("claudeCodePoolKey")} ({pool.apiKey.slice(0, 8)}...)</option>
+                    )}
+                    {runningAccounts.map((a) => (
+                      <option key={a.id} value={a.id}>{a.name} ({a.apiKey.slice(0, 8)}...)</option>
+                    ))}
+                  </select>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
+                  <span style={{ color: "var(--text-muted)", flexShrink: 0, minWidth: 100 }}>{t("claudeCodeModel")}</span>
+                  {modelSelect(model, customModel, setModel, setCustomModel)}
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
+                  <span style={{ color: "var(--text-muted)", flexShrink: 0, minWidth: 100 }}>{t("claudeCodeSmallModel")}</span>
+                  {modelSelect(smallModel, customSmallModel, setSmallModel, setCustomSmallModel)}
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
+                  <span style={{ color: "var(--text-muted)", flexShrink: 0, minWidth: 100 }}>{t("claudeCodeShell")}</span>
+                  <div style={{ display: "flex", gap: 6 }}>
+                    {(["bash", "powershell", "cmd"] as const).map((s) => (
+                      <button
+                        key={s}
+                        className={shell === s ? "primary" : undefined}
+                        onClick={() => void switchShell(s)}
+                        style={{ fontSize: 12, padding: "4px 12px" }}
+                      >
+                        {s}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+              <div style={{ marginTop: 12, display: "flex", gap: 8 }}>
+                <button
+                  className="primary"
+                  onClick={() => void generate()}
+                  disabled={loading || !canGenerate}
+                  style={{ fontSize: 13 }}
+                >
+                  {loading ? t("claudeCodeGenerating") : t("claudeCodeGenerate")}
+                </button>
+              </div>
+              {command && (
+                <div style={{ marginTop: 12 }}>
+                  <div style={{ position: "relative" }}>
+                    <pre style={{
+                      background: "var(--bg)",
+                      border: "1px solid var(--border)",
+                      borderRadius: "var(--radius)",
+                      padding: 12,
+                      fontSize: 12,
+                      fontFamily: "monospace",
+                      whiteSpace: "pre-wrap",
+                      wordBreak: "break-all",
+                      margin: 0,
+                      maxHeight: 200,
+                      overflowY: "auto",
+                    }}>
+                      {command}
+                    </pre>
+                    <button
+                      onClick={copyCommand}
+                      style={{
+                        position: "absolute",
+                        top: 8,
+                        right: 8,
+                        fontSize: 11,
+                        padding: "2px 10px",
+                      }}
+                    >
+                      {copied ? t("claudeCodeCopied") : t("claudeCodeCopy")}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function ModelMappingPanel() {
   const [mappings, setMappings] = useState<Array<ModelMapping>>([])
   const [loading, setLoading] = useState(false)
@@ -651,6 +877,7 @@ function Dashboard() {
       <BatchUsagePanel />
       <ProxyUsagePanel accounts={accounts} />
       <ModelMappingPanel />
+      <ClaudeCodePanel accounts={accounts} proxyPort={proxyPort} pool={pool} />
       {showForm && <AddAccountForm onComplete={handleAdd} onCancel={() => setShowForm(false)} />}
       {loading
         ? <p style={{ color: "var(--text-muted)", textAlign: "center", padding: 40 }}>{t("loading")}</p>

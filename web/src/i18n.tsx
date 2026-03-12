@@ -152,6 +152,23 @@ const en = {
   quickAdd: "Quick Add",
   noRunningInstances: "No running instances. Start an account first.",
   fetchingModels: "Fetching...",
+
+  // Claude Code
+  claudeCode: "Claude Code",
+  claudeCodeDesc: "Generate a startup command for Claude Code that connects through this proxy",
+  claudeCodeModel: "Main Model:",
+  claudeCodeSmallModel: "Small/Fast Model:",
+  claudeCodeApiKey: "API Key:",
+  claudeCodeShell: "Shell:",
+  claudeCodeGenerate: "Generate Command",
+  claudeCodeGenerating: "Generating...",
+  claudeCodeCopy: "Copy",
+  claudeCodeCopied: "Copied!",
+  claudeCodeSelectAccount: "Select an account or pool key",
+  claudeCodeNoAccounts: "No running accounts. Start an account first.",
+  claudeCodePoolKey: "Pool Key",
+  claudeCodeCustomModel: "Custom...",
+  claudeCodeCustomModelPlaceholder: "Enter custom model name",
 } as const
 
 export type TranslationKey = keyof typeof en
@@ -305,6 +322,23 @@ const zh: Translations = {
   quickAdd: "快速添加",
   noRunningInstances: "无运行中的账号实例，请先启动账号",
   fetchingModels: "获取中...",
+
+  // Claude Code
+  claudeCode: "Claude Code",
+  claudeCodeDesc: "生成通过此代理连接的 Claude Code 启动命令",
+  claudeCodeModel: "主模型：",
+  claudeCodeSmallModel: "小/快模型：",
+  claudeCodeApiKey: "API 密钥：",
+  claudeCodeShell: "Shell：",
+  claudeCodeGenerate: "生成命令",
+  claudeCodeGenerating: "生成中...",
+  claudeCodeCopy: "复制",
+  claudeCodeCopied: "已复制！",
+  claudeCodeSelectAccount: "选择账户或池密钥",
+  claudeCodeNoAccounts: "无运行中的账户，请先启动账户",
+  claudeCodePoolKey: "池密钥",
+  claudeCodeCustomModel: "自定义...",
+  claudeCodeCustomModelPlaceholder: "输入自定义模型名称",
 } as const
 
 interface I18nContextValue {

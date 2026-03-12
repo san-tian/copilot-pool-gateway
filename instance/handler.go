@@ -20,8 +20,8 @@ import (
 // DoCompletionsProxy performs the upstream request for completions and returns the raw response.
 // The caller is responsible for closing resp.Body.
 func DoCompletionsProxy(_ *gin.Context, state *config.State, bodyBytes []byte) (*http.Response, error) {
-	bodyBytes, extraHeaders := normalizeCompletionsPayload(bodyBytes)
-	return ProxyRequestWithBytes(state, "POST", "/chat/completions", bodyBytes, extraHeaders, false)
+	bodyBytes, extraHeaders, hasVision := normalizeCompletionsPayload(state, bodyBytes)
+	return ProxyRequestWithBytes(state, "POST", "/chat/completions", bodyBytes, extraHeaders, hasVision)
 }
 
 // ForwardCompletionsResponse writes the upstream response to the client.
@@ -87,10 +87,14 @@ func ModelsHandler(c *gin.Context, state *config.State) {
 	}
 	for i, m := range models.Data {
 		mapped.Data[i] = config.ModelEntry{
-			ID:      store.ToDisplayID(m.ID),
-			Object:  m.Object,
-			Created: m.Created,
-			OwnedBy: m.OwnedBy,
+			ID:           store.ToDisplayID(m.ID),
+			Object:       m.Object,
+			Created:      m.Created,
+			OwnedBy:      m.OwnedBy,
+			Name:         m.Name,
+			Version:      m.Version,
+			Vendor:       m.Vendor,
+			Capabilities: m.Capabilities,
 		}
 	}
 
@@ -128,6 +132,14 @@ func DoMessagesProxy(c *gin.Context, state *config.State, bodyBytes []byte) (*ht
 	var anthropicPayload anthropic.AnthropicMessagesPayload
 	if err := json.Unmarshal(bodyBytes, &anthropicPayload); err != nil {
 		return nil, fmt.Errorf("invalid request: %v", err)
+	}
+
+	// Auto-fill max_tokens from model capabilities if not provided
+	if anthropicPayload.MaxTokens == 0 {
+		copilotModelID := anthropic.NormalizeAnthropicModel(store.ToCopilotID(anthropicPayload.Model))
+		if limit := lookupMaxOutputTokens(state, copilotModelID); limit > 0 {
+			anthropicPayload.MaxTokens = limit
+		}
 	}
 
 	hasVision := checkVisionContent(anthropicPayload)
@@ -269,28 +281,91 @@ func handleAnthropicStream(c *gin.Context, resp *http.Response) {
 	}
 }
 
-func normalizeCompletionsPayload(bodyBytes []byte) ([]byte, http.Header) {
+func normalizeCompletionsPayload(state *config.State, bodyBytes []byte) ([]byte, http.Header, bool) {
 	extraHeaders := make(http.Header)
 	extraHeaders.Set("X-Initiator", "user")
 
 	var payload map[string]interface{}
 	if err := json.Unmarshal(bodyBytes, &payload); err != nil {
-		return bodyBytes, extraHeaders
+		return bodyBytes, extraHeaders, false
 	}
 
 	if model, ok := payload["model"].(string); ok {
 		payload["model"] = store.ToCopilotID(model)
 	}
 
+	// Auto-fill max_tokens from model capabilities if not provided
+	modelID, _ := payload["model"].(string)
+	if _, hasMax := payload["max_tokens"]; !hasMax {
+		if _, hasMaxComp := payload["max_completion_tokens"]; !hasMaxComp {
+			if limit := lookupMaxOutputTokens(state, modelID); limit > 0 {
+				payload["max_tokens"] = limit
+			}
+		}
+	}
+
 	if hasAgentMessages(payload["messages"]) {
 		extraHeaders.Set("X-Initiator", "agent")
 	}
 
+	hasVision := checkCompletionsVision(payload["messages"])
+
 	normalized, err := json.Marshal(payload)
 	if err != nil {
-		return bodyBytes, extraHeaders
+		return bodyBytes, extraHeaders, hasVision
 	}
-	return normalized, extraHeaders
+	return normalized, extraHeaders, hasVision
+}
+
+// lookupMaxOutputTokens finds the max_output_tokens for a model from cached capabilities.
+func lookupMaxOutputTokens(state *config.State, modelID string) int {
+	if state == nil || modelID == "" {
+		return 0
+	}
+	state.RLock()
+	models := state.Models
+	state.RUnlock()
+	if models == nil {
+		return 0
+	}
+	for _, m := range models.Data {
+		if m.ID == modelID && m.Capabilities != nil && m.Capabilities.Limits.MaxOutputTokens > 0 {
+			return m.Capabilities.Limits.MaxOutputTokens
+		}
+	}
+	return 0
+}
+
+// checkCompletionsVision checks OpenAI-format messages for image_url content.
+func checkCompletionsVision(rawMessages interface{}) bool {
+	messages, ok := rawMessages.([]interface{})
+	if !ok {
+		return false
+	}
+	for _, rawMsg := range messages {
+		msg, ok := rawMsg.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		content, ok := msg["content"]
+		if !ok {
+			continue
+		}
+		parts, ok := content.([]interface{})
+		if !ok {
+			continue
+		}
+		for _, rawPart := range parts {
+			part, ok := rawPart.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if partType, _ := part["type"].(string); partType == "image_url" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func initiatorFromMessages(messages []anthropic.OpenAIMessage) string {

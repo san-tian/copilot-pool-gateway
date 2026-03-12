@@ -233,4 +233,11 @@ export const api = {
 
   getProxyAccountUsage: (id: string) =>
     request<ProxyUsageSnapshot>(`/usage/${id}`),
+
+  // Claude Code command generator
+  generateClaudeCodeCommand: (data: { model: string; smallModel: string; apiKey: string }) =>
+    request<{ bash: string; powershell: string; cmd: string }>("/claude-code-command", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
 }

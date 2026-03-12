@@ -93,6 +93,9 @@ func RegisterConsoleAPI(r *gin.Engine, proxyPort int) {
 	// Proxy usage stats (from in-memory tracking)
 	protected.GET("/usage", handleGetProxyUsage)
 	protected.GET("/usage/:id", handleGetProxyAccountUsage)
+
+	// Claude Code command generator
+	protected.POST("/claude-code-command", handleClaudeCodeCommand(proxyPort))
 }
 
 func adminAuthMiddleware() gin.HandlerFunc {
@@ -635,6 +638,71 @@ func handleGetProxyAccountUsage(c *gin.Context) {
 	id := c.Param("id")
 	snapshot := instance.GetUsageSnapshot(id)
 	c.JSON(http.StatusOK, snapshot)
+}
+
+// --- Claude Code command generator ---
+
+func handleClaudeCodeCommand(proxyPort int) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var body struct {
+			Model      string `json:"model"`
+			SmallModel string `json:"smallModel"`
+			ApiKey     string `json:"apiKey"`
+		}
+		if err := c.ShouldBindJSON(&body); err != nil || body.ApiKey == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "apiKey is required"})
+			return
+		}
+
+		baseURL := fmt.Sprintf("http://127.0.0.1:%d", proxyPort)
+		model := body.Model
+		if model == "" {
+			model = "claude-sonnet-4"
+		}
+		smallModel := body.SmallModel
+		if smallModel == "" {
+			smallModel = model
+		}
+
+		bash := fmt.Sprintf(
+			`ANTHROPIC_BASE_URL=%s \`+"\n"+
+				`ANTHROPIC_AUTH_TOKEN=%s \`+"\n"+
+				`ANTHROPIC_MODEL=%s \`+"\n"+
+				`ANTHROPIC_SMALL_FAST_MODEL=%s \`+"\n"+
+				`DISABLE_NON_ESSENTIAL_MODEL_CALLS=1 \`+"\n"+
+				`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \`+"\n"+
+				`claude`,
+			baseURL, body.ApiKey, model, smallModel,
+		)
+
+		powershell := fmt.Sprintf(
+			`$env:ANTHROPIC_BASE_URL="%s"`+"\n"+
+				`$env:ANTHROPIC_AUTH_TOKEN="%s"`+"\n"+
+				`$env:ANTHROPIC_MODEL="%s"`+"\n"+
+				`$env:ANTHROPIC_SMALL_FAST_MODEL="%s"`+"\n"+
+				`$env:DISABLE_NON_ESSENTIAL_MODEL_CALLS="1"`+"\n"+
+				`$env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"`+"\n"+
+				`claude`,
+			baseURL, body.ApiKey, model, smallModel,
+		)
+
+		cmd := fmt.Sprintf(
+			`set ANTHROPIC_BASE_URL=%s`+"\n"+
+				`set ANTHROPIC_AUTH_TOKEN=%s`+"\n"+
+				`set ANTHROPIC_MODEL=%s`+"\n"+
+				`set ANTHROPIC_SMALL_FAST_MODEL=%s`+"\n"+
+				`set DISABLE_NON_ESSENTIAL_MODEL_CALLS=1`+"\n"+
+				`set CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`+"\n"+
+				`claude`,
+			baseURL, body.ApiKey, model, smallModel,
+		)
+
+		c.JSON(http.StatusOK, gin.H{
+			"bash":       bash,
+			"powershell": powershell,
+			"cmd":        cmd,
+		})
+	}
 }
 
 // fetchCopilotUsage fetches usage/quota data for a running account from GitHub Copilot API.

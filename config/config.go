@@ -62,11 +62,27 @@ type ModelsResponse struct {
 	Data   []ModelEntry `json:"data"`
 }
 
+type ModelCapabilities struct {
+	Family string      `json:"family,omitempty"`
+	Limits ModelLimits `json:"limits,omitempty"`
+	Type   string      `json:"type,omitempty"`
+}
+
+type ModelLimits struct {
+	MaxOutputTokens  int `json:"max_output_tokens,omitempty"`
+	MaxPromptTokens  int `json:"max_prompt_tokens,omitempty"`
+	MaxContextWindow int `json:"max_context_window,omitempty"`
+}
+
 type ModelEntry struct {
-	ID      string `json:"id"`
-	Object  string `json:"object"`
-	Created int64  `json:"created"`
-	OwnedBy string `json:"owned_by"`
+	ID           string             `json:"id"`
+	Object       string             `json:"object"`
+	Created      int64              `json:"created"`
+	OwnedBy      string             `json:"owned_by"`
+	Name         string             `json:"name,omitempty"`
+	Version      string             `json:"version,omitempty"`
+	Vendor       string             `json:"vendor,omitempty"`
+	Capabilities *ModelCapabilities `json:"capabilities,omitempty"`
 }
 
 type CopilotTokenResponse struct {

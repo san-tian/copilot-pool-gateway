@@ -11,7 +11,7 @@ import (
 // TranslateToOpenAI converts an Anthropic messages payload to OpenAI chat completions payload.
 func TranslateToOpenAI(payload AnthropicMessagesPayload) ChatCompletionsPayload {
 	result := ChatCompletionsPayload{
-		Model:       normalizeAnthropicModel(store.ToCopilotID(payload.Model)),
+		Model:       NormalizeAnthropicModel(store.ToCopilotID(payload.Model)),
 		Stream:      payload.Stream,
 		Temperature: payload.Temperature,
 		TopP:        payload.TopP,
@@ -74,7 +74,8 @@ func TranslateToOpenAI(payload AnthropicMessagesPayload) ChatCompletionsPayload 
 	return result
 }
 
-func normalizeAnthropicModel(model string) string {
+// NormalizeAnthropicModel normalizes Anthropic model names by stripping date suffixes.
+func NormalizeAnthropicModel(model string) string {
 	switch {
 	case strings.HasPrefix(model, "claude-sonnet-4-"):
 		return "claude-sonnet-4"
