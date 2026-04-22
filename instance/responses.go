@@ -117,7 +117,13 @@ func ForwardResponsesResponse(c *gin.Context, accountID string, turnRequest copi
 func forwardResponsesStream(c *gin.Context, accountID string, turnRequest copilotTurnRequest, requestBody []byte, resp *http.Response) {
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
-	c.Header("Connection", "keep-alive")
+	// Close the TCP socket after the stream finishes. Some downstream agents
+	// (notably the pi client) treat a turn as "done" only on TCP FIN, not on
+	// the chunked-body terminator. Keeping the connection alive across the
+	// terminal SSE event leaves them spinning in a working state even after
+	// response.completed has been fully delivered.
+	c.Header("Connection", "close")
+	c.Request.Close = true
 	c.Header("X-Accel-Buffering", "no")
 	c.Status(resp.StatusCode)
 
@@ -146,6 +152,16 @@ func forwardResponsesStream(c *gin.Context, accountID string, turnRequest copilo
 			}
 			if flusher, ok := w.(http.Flusher); ok {
 				flusher.Flush()
+			}
+			// Some upstreams (Copilot /responses in particular) keep the TCP
+			// socket open for keep-alive reuse after the terminal event. If we
+			// blindly wait for EOF, downstream agents that rely on connection
+			// close to mark a turn "done" stay stuck in a working state. Once
+			// the terminal event has been fully delivered (event body + the
+			// blank line that ends the SSE event), we stop reading so the
+			// response finishes and the client socket closes.
+			if probe.sawResponseDone && probe.endedWithBlankSep {
+				return false
 			}
 		}
 		if err != nil {
@@ -225,6 +241,12 @@ func (p *streamTailProbe) log(kind, reqID, accountID string, elapsed time.Durati
 		exitReason = "write_err"
 	} else if exitErr != nil && exitErr != io.EOF {
 		exitReason = "read_err"
+	} else if exitErr == nil && p.endedWithBlankSep && (p.sawResponseDone || p.sawDataDONE) {
+		// Early close: we proactively returned from the stream loop after the
+		// terminal event's blank separator was flushed, instead of waiting for
+		// upstream EOF. Downstream clients that gate on socket close now
+		// unblock immediately.
+		exitReason = "terminal_early_close"
 	}
 
 	// Render the last few lines as a single-line, quoted list with visible escapes.

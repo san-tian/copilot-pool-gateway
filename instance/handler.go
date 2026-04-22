@@ -38,7 +38,10 @@ func ForwardCompletionsResponse(c *gin.Context, resp *http.Response) {
 	if isStream {
 		c.Header("Content-Type", "text/event-stream")
 		c.Header("Cache-Control", "no-cache")
-		c.Header("Connection", "keep-alive")
+		// Close the TCP socket after the stream finishes — see the matching
+		// rationale in forwardResponsesStream.
+		c.Header("Connection", "close")
+		c.Request.Close = true
 		c.Header("X-Accel-Buffering", "no")
 		c.Status(resp.StatusCode)
 
@@ -63,6 +66,13 @@ func ForwardCompletionsResponse(c *gin.Context, resp *http.Response) {
 				}
 				if flusher, ok := w.(http.Flusher); ok {
 					flusher.Flush()
+				}
+				// Stop reading once the terminal SSE event (data: [DONE] or a
+				// response.completed/failed/incomplete marker) plus its
+				// trailing blank line has been flushed — see the matching
+				// comment in forwardResponsesStream for rationale.
+				if (probe.sawDataDONE || probe.sawResponseDone) && probe.endedWithBlankSep {
+					return false
 				}
 			}
 			if err != nil {
@@ -242,7 +252,10 @@ func handleAnthropicStream(c *gin.Context, accountID string, turnRequest copilot
 
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
-	c.Header("Connection", "keep-alive")
+	// Close the TCP socket after the stream finishes — see the matching
+	// rationale in forwardResponsesStream.
+	c.Header("Connection", "close")
+	c.Request.Close = true
 	c.Header("X-Accel-Buffering", "no")
 	c.Header("Transfer-Encoding", "chunked")
 	c.Status(http.StatusOK)

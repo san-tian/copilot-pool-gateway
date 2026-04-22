@@ -103,19 +103,49 @@ func forwardNativeAnthropicResponse(c *gin.Context, resp *http.Response) {
 	if isStream {
 		c.Header("Content-Type", "text/event-stream")
 		c.Header("Cache-Control", "no-cache")
-		c.Header("Connection", "keep-alive")
+		// Close the TCP socket after the stream finishes — see the matching
+		// rationale in forwardResponsesStream.
+		c.Header("Connection", "close")
+		c.Request.Close = true
 		c.Header("X-Accel-Buffering", "no")
 		c.Status(resp.StatusCode)
 
 		reader := bufio.NewReaderSize(resp.Body, 10*1024*1024)
+		sawMessageStop := false
+		lastBlank := false
 		c.Stream(func(w io.Writer) bool {
 			line, err := reader.ReadBytes('\n')
 			if len(line) > 0 {
+				trimmed := bytes.TrimRight(line, "\r\n")
+				if len(trimmed) == 0 {
+					lastBlank = true
+				} else {
+					lastBlank = false
+					if bytes.HasPrefix(trimmed, []byte("event:")) {
+						ev := bytes.TrimSpace(bytes.TrimPrefix(trimmed, []byte("event:")))
+						if bytes.Equal(ev, []byte("message_stop")) {
+							sawMessageStop = true
+						}
+					} else if bytes.HasPrefix(trimmed, []byte("data:")) {
+						payload := bytes.TrimSpace(bytes.TrimPrefix(trimmed, []byte("data:")))
+						if bytes.Contains(payload, []byte(`"type":"message_stop"`)) {
+							sawMessageStop = true
+						}
+					}
+				}
 				if _, writeErr := w.Write(line); writeErr != nil {
 					return false
 				}
 				if flusher, ok := w.(http.Flusher); ok {
 					flusher.Flush()
+				}
+				// Anthropic's terminal event is `message_stop`. Once it and
+				// its trailing blank line have been forwarded, stop reading —
+				// some upstreams hold the socket open for keep-alive reuse
+				// after the final event, which would leave downstream agents
+				// spinning in a working state waiting for close.
+				if sawMessageStop && lastBlank {
+					return false
 				}
 			}
 			if err != nil {
