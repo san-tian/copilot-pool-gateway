@@ -118,6 +118,7 @@ func DoResponsesCompactProxy(state *config.State, bodyBytes []byte) (*http.Respo
 		"output": []interface{}{
 			map[string]interface{}{
 				"type": "compaction_summary",
+				"encrypted_content": summaryText,
 				"summary": []interface{}{
 					map[string]interface{}{"type": "summary_text", "text": summaryText},
 				},
@@ -348,7 +349,7 @@ func collectCompactSummaryParts(value interface{}) []string {
 		return parts
 	case map[string]interface{}:
 		parts := make([]string, 0, 4)
-		for _, key := range []string{"summary_text", "text", "content", "title"} {
+		for _, key := range []string{"summary_text", "text", "content", "title", "encrypted_content"} {
 			parts = append(parts, collectCompactSummaryParts(typed[key])...)
 		}
 		if summary, ok := typed["summary"].([]interface{}); ok {
