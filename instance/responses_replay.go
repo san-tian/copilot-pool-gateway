@@ -519,6 +519,14 @@ func DegradeOrphanContinuationPayload(body []byte) ([]byte, int, error) {
 			continue
 		}
 		itemType := strings.TrimSpace(strings.ToLower(fmt.Sprint(mapped["type"])))
+		if itemType == "reasoning" {
+			// Drop reasoning items: their encrypted_content is ciphertext
+			// bound to the original response, and upstream rejects the payload
+			// with "input item does not belong to this connection" if any
+			// reasoning item survives the degrade.
+			changed++
+			continue
+		}
 		isTool := itemType == "function_call" || itemType == "function_call_output"
 		if isTool && toolsDropped < dropTool {
 			toolsDropped++

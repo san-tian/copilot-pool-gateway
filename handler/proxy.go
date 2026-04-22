@@ -36,6 +36,103 @@ func truncateForLog(s string, max int) string {
 	return s[:max] + "..."
 }
 
+// peekAndRestoreBody reads resp.Body in full for logging, then rewinds it via
+// NopCloser so downstream code can still read it. Safe to call when the caller
+// will close or forward the body next. Returns "" for nil / streaming / read-err.
+func peekAndRestoreBody(resp *http.Response, maxBytes int) string {
+	if resp == nil || resp.Body == nil {
+		return ""
+	}
+	if strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
+		return ""
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return ""
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	return truncateForLog(string(body), maxBytes)
+}
+
+// degradedBodyTopLevelKeys parses a JSON body and returns a sorted comma-joined
+// list of its top-level keys. Used to quickly see which fields survive the
+// orphan-continuation degrade pass — we want to know whether fields like
+// "conversation", "previous_response_id", or "store" are leaking through.
+func degradedBodyTopLevelKeys(body []byte) string {
+	var payload map[string]interface{}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return "<parse-err>"
+	}
+	keys := make([]string, 0, len(payload))
+	for k := range payload {
+		keys = append(keys, k)
+	}
+	for i := 0; i < len(keys); i++ {
+		for j := i + 1; j < len(keys); j++ {
+			if keys[j] < keys[i] {
+				keys[i], keys[j] = keys[j], keys[i]
+			}
+		}
+	}
+	return strings.Join(keys, ",")
+}
+
+// degradedInputShape summarizes the degraded input[] array: counts per item
+// type, and how many items carry an "encrypted_content" field or a role
+// message.content[].type. Used to pinpoint which surviving item structure is
+// tripping upstream's "input item does not belong to this connection" check.
+func degradedInputShape(body []byte) string {
+	var payload map[string]interface{}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return "<parse-err>"
+	}
+	input, ok := payload["input"].([]interface{})
+	if !ok {
+		return "<no-input>"
+	}
+	typeCounts := map[string]int{}
+	encryptedContent := 0
+	hasID := 0
+	hasCallID := 0
+	for _, raw := range input {
+		m, ok := raw.(map[string]interface{})
+		if !ok {
+			typeCounts["<non-object>"]++
+			continue
+		}
+		itemType, _ := m["type"].(string)
+		typeCounts[itemType]++
+		if _, ok := m["encrypted_content"]; ok {
+			encryptedContent++
+		}
+		if id, _ := m["id"].(string); id != "" {
+			hasID++
+		}
+		if callID, _ := m["call_id"].(string); callID != "" {
+			hasCallID++
+		}
+	}
+	parts := make([]string, 0, len(typeCounts)+3)
+	typeKeys := make([]string, 0, len(typeCounts))
+	for k := range typeCounts {
+		typeKeys = append(typeKeys, k)
+	}
+	for i := 0; i < len(typeKeys); i++ {
+		for j := i + 1; j < len(typeKeys); j++ {
+			if typeKeys[j] < typeKeys[i] {
+				typeKeys[i], typeKeys[j] = typeKeys[j], typeKeys[i]
+			}
+		}
+	}
+	for _, k := range typeKeys {
+		parts = append(parts, fmt.Sprintf("%s=%d", k, typeCounts[k]))
+	}
+	parts = append(parts, fmt.Sprintf("encrypted_content=%d", encryptedContent))
+	parts = append(parts, fmt.Sprintf("id=%d", hasID))
+	parts = append(parts, fmt.Sprintf("call_id=%d", hasCallID))
+	return strings.Join(parts, " ")
+}
+
 // RegisterProxy sets up the proxy server routes.
 func RegisterProxy(r *gin.Engine) {
 	// Initialize rate limiter from environment.
@@ -939,6 +1036,8 @@ func proxyResponses(c *gin.Context) {
 						crossAccountRollover = false
 						log.Printf("[responses rid=%s attempt=%d] orphan continuation on account=%s mode=%s, degraded %d fc items to text, retrying fresh; detail=%q",
 							reqID, attempt, resolved.AccountID, modeName, changed, truncateForLog(detail, 240))
+						log.Printf("[responses rid=%s attempt=%d] degraded body top-level keys=%s input_shape=[%s]",
+							reqID, attempt, degradedBodyTopLevelKeys(degradedBody), degradedInputShape(degradedBody))
 						continue
 					}
 					log.Printf("[responses rid=%s attempt=%d] orphan degrade skipped (changed=%d err=%v)", reqID, attempt, changed, degErr)
@@ -977,6 +1076,10 @@ func proxyResponses(c *gin.Context) {
 		// and we fall through to isRetryableStatus for cross-account rollover.
 		if resp.StatusCode == http.StatusUnauthorized && !refreshedOnAccount[resolved.AccountID] && attempt < attemptLimit-1 {
 			instance.RecordRequest(resolved.AccountID, true, false)
+			if orphanDegraded {
+				log.Printf("[responses rid=%s attempt=%d] post-degrade 401 body on account=%s: %q",
+					reqID, attempt, resolved.AccountID, peekAndRestoreBody(resp, 400))
+			}
 			_ = resp.Body.Close()
 			refreshedOnAccount[resolved.AccountID] = true
 			if refreshErr := instance.ForceRefreshToken(resolved.AccountID); refreshErr != nil {
@@ -996,6 +1099,10 @@ func proxyResponses(c *gin.Context) {
 		if isRetryableStatus(resp.StatusCode) && attempt < attemptLimit-1 {
 			is429 := resp.StatusCode == http.StatusTooManyRequests
 			instance.RecordRequest(resolved.AccountID, true, is429)
+			if orphanDegraded {
+				log.Printf("[responses rid=%s attempt=%d] post-degrade %d body on account=%s: %q",
+					reqID, attempt, resp.StatusCode, resolved.AccountID, peekAndRestoreBody(resp, 400))
+			}
 			_ = resp.Body.Close()
 			if continuationRequested && continuationCanDetach && isPool == true {
 				exclude[resolved.AccountID] = true
@@ -1010,6 +1117,10 @@ func proxyResponses(c *gin.Context) {
 			}
 		}
 
+		if orphanDegraded && resp.StatusCode >= 400 {
+			log.Printf("[responses rid=%s attempt=%d] post-degrade %d body on account=%s (final): %q",
+				reqID, attempt, resp.StatusCode, resolved.AccountID, peekAndRestoreBody(resp, 400))
+		}
 		log.Printf("[responses rid=%s attempt=%d] forwarding upstream_status=%d account=%s mode=%s",
 			reqID, attempt, resp.StatusCode, resolved.AccountID, modeName)
 		c.Set("respReqID", reqID)
