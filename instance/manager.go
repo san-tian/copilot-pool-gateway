@@ -10,11 +10,11 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
 	"copilot-go/config"
-	"copilot-go/copilot"
 	"copilot-go/store"
 )
 
@@ -31,64 +31,10 @@ type CopilotUser struct {
 	AvatarURL string `json:"avatar_url"`
 }
 
-func StartInstance(account store.Account) error {
-	mu.Lock()
-	if inst, ok := instances[account.ID]; ok {
-		if inst.Status == "running" {
-			mu.Unlock()
-			return nil
-		}
-	}
-	mu.Unlock()
-
-	state := config.NewState()
-	state.Lock()
-	state.GithubToken = account.GithubToken
-	state.AccountType = account.AccountType
-	state.Unlock()
-
-	// Get VSCode version
-	vsVer := copilot.GetVSCodeVersion()
-	state.Lock()
-	state.VSCodeVersion = vsVer
-	state.Unlock()
-
-	// Get Copilot token
-	if err := refreshCopilotToken(state); err != nil {
-		mu.Lock()
-		instances[account.ID] = &ProxyInstance{
-			Account: account,
-			State:   state,
-			Status:  "error",
-			Error:   err.Error(),
-		}
-		mu.Unlock()
-		return err
-	}
-
-	// Get models
-	if err := fetchModels(state); err != nil {
-		log.Printf("Warning: failed to fetch models for account %s: %v", account.Name, err)
-	}
-
-	stopChan := make(chan struct{})
-	inst := &ProxyInstance{
-		Account:  account,
-		State:    state,
-		Status:   "running",
-		stopChan: stopChan,
-	}
-
-	mu.Lock()
-	instances[account.ID] = inst
-	mu.Unlock()
-
-	// Start background token refresh
-	go tokenRefreshLoop(inst)
-
-	log.Printf("Instance started for account: %s", account.Name)
-	return nil
-}
+var (
+	githubCopilotURL = config.GithubCopilotURL
+	copilotBaseURL   = config.CopilotBaseURL
+)
 
 func StopInstance(accountID string) {
 	mu.Lock()
@@ -97,8 +43,9 @@ func StopInstance(accountID string) {
 		mu.Unlock()
 		return
 	}
-	if inst.Status == "running" {
+	if inst.Status == "running" && inst.stopChan != nil {
 		close(inst.stopChan)
+		inst.stopChan = nil
 	}
 	inst.Status = "stopped"
 	mu.Unlock()
@@ -130,6 +77,17 @@ func GetInstanceState(accountID string) *config.State {
 		return inst.State
 	}
 	return nil
+}
+
+// ForceRefreshToken forces a Copilot token refresh for the given account. Intended for
+// request-path callers that just observed a 401 from upstream, letting the next retry on
+// the same account use a freshly-minted token instead of the one that may have just expired.
+func ForceRefreshToken(accountID string) error {
+	state := GetInstanceState(accountID)
+	if state == nil {
+		return fmt.Errorf("instance not found for account %s", accountID)
+	}
+	return refreshCopilotToken(state)
 }
 
 // GetAllCachedModels collects and deduplicates model entries from all running instances.
@@ -241,7 +199,7 @@ func tokenRefreshLoop(inst *ProxyInstance) {
 }
 
 func refreshCopilotToken(state *config.State) error {
-	req, err := http.NewRequest("GET", config.GithubCopilotURL, nil)
+	req, err := http.NewRequest("GET", githubCopilotURL, nil)
 	if err != nil {
 		return err
 	}
@@ -299,7 +257,7 @@ func refreshCopilotTokenWithRetry(state *config.State, maxRetries int) error {
 
 func fetchModels(state *config.State) error {
 	state.RLock()
-	baseURL := config.CopilotBaseURL(state.AccountType)
+	baseURL := copilotBaseURL(state.AccountType)
 	state.RUnlock()
 
 	req, err := http.NewRequest("GET", baseURL+"/models", nil)
@@ -320,13 +278,16 @@ func fetchModels(state *config.State) error {
 	if err != nil {
 		return err
 	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("models request failed (status %d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
 
 	var models config.ModelsResponse
 	if err := json.Unmarshal(body, &models); err != nil {
 		// Try parsing as array
 		var modelList []config.ModelEntry
 		if err2 := json.Unmarshal(body, &modelList); err2 != nil {
-			return fmt.Errorf("failed to parse models: %w", err)
+			return fmt.Errorf("failed to parse models response: %s", strings.TrimSpace(string(body)))
 		}
 		models = config.ModelsResponse{
 			Object: "list",
@@ -422,7 +383,7 @@ func ProxyRequestWithBytes(state *config.State, method, path string, bodyBytes [
 
 func ProxyRequestWithBytesCtx(ctx context.Context, state *config.State, method, path string, bodyBytes []byte, extraHeaders http.Header, hasVision bool) (*http.Response, error) {
 	state.RLock()
-	baseURL := config.CopilotBaseURL(state.AccountType)
+	baseURL := copilotBaseURL(state.AccountType)
 	state.RUnlock()
 
 	url := baseURL + path

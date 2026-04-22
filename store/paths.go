@@ -3,16 +3,26 @@ package store
 import (
 	"os"
 	"path/filepath"
+	"strings"
 )
 
-var AppDir string
+const AppDirEnvVar = "COPILOT_API_APP_DIR"
 
-func init() {
+var AppDir = resolveAppDirFromEnv()
+
+func defaultAppDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		home = "."
 	}
-	AppDir = filepath.Join(home, ".local", "share", "copilot-api")
+	return filepath.Join(home, ".local", "share", "copilot-api")
+}
+
+func resolveAppDirFromEnv() string {
+	if override := strings.TrimSpace(os.Getenv(AppDirEnvVar)); override != "" {
+		return override
+	}
+	return defaultAppDir()
 }
 
 func AccountsFile() string {
@@ -39,7 +49,7 @@ func EnsurePaths() error {
 	if err := os.MkdirAll(AppDir, 0755); err != nil {
 		return err
 	}
-	files := []string{AccountsFile(), PoolConfigFile(), AdminFile(), ModelMapFile(), ProxyConfigFile()}
+	files := []string{AccountsFile(), PoolConfigFile(), AdminFile(), ModelMapFile(), ProxyConfigFile(), PublicReauthFile()}
 	for _, f := range files {
 		if _, err := os.Stat(f); os.IsNotExist(err) {
 			if err := os.WriteFile(f, []byte("{}"), 0644); err != nil {

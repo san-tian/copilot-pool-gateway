@@ -3,6 +3,7 @@ package store
 import (
 	"encoding/json"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -10,14 +11,22 @@ import (
 )
 
 type Account struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	GithubToken string `json:"githubToken"`
-	AccountType string `json:"accountType"`
-	ApiKey      string `json:"apiKey"`
-	Enabled     bool   `json:"enabled"`
-	CreatedAt   string `json:"createdAt"`
-	Priority    int    `json:"priority"`
+	ID                string   `json:"id"`
+	Name              string   `json:"name"`
+	GithubToken       string   `json:"githubToken"`
+	GithubLogin       string   `json:"githubLogin,omitempty"`
+	GithubUserID      int64    `json:"githubUserId,omitempty"`
+	BlockedModels     []string `json:"blockedModels,omitempty"`
+	SupportedModels   []string `json:"supportedModels,omitempty"`
+	UnsupportedModels []string `json:"unsupportedModels,omitempty"`
+	AccountType       string   `json:"accountType"`
+	ApiKey            string   `json:"apiKey"`
+	Enabled           bool     `json:"enabled"`
+	CreatedAt         string   `json:"createdAt"`
+	Priority          int      `json:"priority"`
+	ProbeStatus       string   `json:"probeStatus,omitempty"`
+	ProbeCheckedAt    string   `json:"probeCheckedAt,omitempty"`
+	ProbeError        string   `json:"probeError,omitempty"`
 }
 
 type PoolConfig struct {
@@ -46,7 +55,6 @@ func readAccounts() ([]Account, error) {
 	}
 	var s accountStore
 	if err := json.Unmarshal(data, &s); err != nil {
-		// Try as array directly
 		var accounts []Account
 		if err2 := json.Unmarshal(data, &accounts); err2 != nil {
 			return []Account{}, nil
@@ -111,31 +119,182 @@ func GetEnabledAccounts() ([]Account, error) {
 	return enabled, nil
 }
 
-func AddAccount(name, githubToken, accountType string) (*Account, error) {
+func normalizeModelKey(model string) string {
+	return strings.TrimSpace(strings.ToLower(model))
+}
+
+func hasBlockedModel(account Account, model string) bool {
+	normalized := normalizeModelKey(model)
+	if normalized == "" {
+		return false
+	}
+	for _, blocked := range account.BlockedModels {
+		if normalizeModelKey(blocked) == normalized {
+			return true
+		}
+	}
+	for _, blocked := range account.UnsupportedModels {
+		if normalizeModelKey(blocked) == normalized {
+			return true
+		}
+	}
+	return false
+}
+
+func stringSliceFromValue(value interface{}) []string {
+	switch v := value.(type) {
+	case []string:
+		return append([]string(nil), v...)
+	case []interface{}:
+		result := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok && s != "" {
+				result = append(result, s)
+			}
+		}
+		return result
+	default:
+		return nil
+	}
+}
+
+func IsModelBlocked(accountID, model string) bool {
+	accountMu.RLock()
+	defer accountMu.RUnlock()
+
+	accounts, err := readAccounts()
+	if err != nil {
+		return false
+	}
+	for _, account := range accounts {
+		if account.ID == accountID {
+			return hasBlockedModel(account, model)
+		}
+	}
+	return false
+}
+
+func GetBlockedAccountIDs(model string) map[string]bool {
+	blocked := map[string]bool{}
+	normalized := normalizeModelKey(model)
+	if normalized == "" {
+		return blocked
+	}
+
+	accountMu.RLock()
+	defer accountMu.RUnlock()
+
+	accounts, err := readAccounts()
+	if err != nil {
+		return blocked
+	}
+	for _, account := range accounts {
+		if hasBlockedModel(account, normalized) {
+			blocked[account.ID] = true
+		}
+	}
+	return blocked
+}
+
+func BlockModelForAccount(accountID, model string) error {
+	normalized := normalizeModelKey(model)
+	if normalized == "" {
+		return nil
+	}
+
 	accountMu.Lock()
 	defer accountMu.Unlock()
 
 	accounts, err := readAccounts()
 	if err != nil {
-		return nil, err
+		return err
+	}
+	for i, account := range accounts {
+		if account.ID != accountID {
+			continue
+		}
+		if hasBlockedModel(account, normalized) {
+			return nil
+		}
+		accounts[i].BlockedModels = append(accounts[i].BlockedModels, normalized)
+		return writeAccounts(accounts)
+	}
+	return nil
+}
+
+func AddAccount(name, githubToken, accountType string) (*Account, error) {
+	account, _, err := UpsertAccount("", name, githubToken, accountType, "", 0)
+	return account, err
+}
+
+func matchesGithubIdentity(account Account, githubLogin string, githubUserID int64) bool {
+	if githubUserID != 0 && account.GithubUserID != 0 && account.GithubUserID == githubUserID {
+		return true
+	}
+	if githubLogin != "" && account.GithubLogin != "" && strings.EqualFold(account.GithubLogin, githubLogin) {
+		return true
+	}
+	return false
+}
+
+func UpsertAccount(existingID, name, githubToken, accountType, githubLogin string, githubUserID int64) (*Account, bool, error) {
+	accountMu.Lock()
+	defer accountMu.Unlock()
+
+	accounts, err := readAccounts()
+	if err != nil {
+		return nil, false, err
+	}
+
+	for i, a := range accounts {
+		if (existingID != "" && a.ID == existingID) || (existingID == "" && matchesGithubIdentity(a, githubLogin, githubUserID)) {
+			if name != "" {
+				accounts[i].Name = name
+			}
+			accounts[i].GithubToken = githubToken
+			accounts[i].BlockedModels = nil
+			accounts[i].SupportedModels = nil
+			accounts[i].UnsupportedModels = nil
+			accounts[i].ProbeStatus = ""
+			accounts[i].ProbeCheckedAt = ""
+			accounts[i].ProbeError = ""
+			if accountType != "" {
+				accounts[i].AccountType = accountType
+			}
+			if githubLogin != "" {
+				accounts[i].GithubLogin = githubLogin
+			}
+			if githubUserID != 0 {
+				accounts[i].GithubUserID = githubUserID
+			}
+			if err := writeAccounts(accounts); err != nil {
+				return nil, false, err
+			}
+			return &accounts[i], false, nil
+		}
 	}
 
 	account := Account{
-		ID:          uuid.New().String(),
-		Name:        name,
-		GithubToken: githubToken,
-		AccountType: accountType,
-		ApiKey:      "sk-" + uuid.New().String(),
-		Enabled:     true,
-		CreatedAt:   time.Now().UTC().Format(time.RFC3339),
-		Priority:    0,
+		ID:                uuid.New().String(),
+		Name:              name,
+		GithubToken:       githubToken,
+		GithubLogin:       githubLogin,
+		GithubUserID:      githubUserID,
+		BlockedModels:     nil,
+		SupportedModels:   nil,
+		UnsupportedModels: nil,
+		AccountType:       accountType,
+		ApiKey:            "sk-" + uuid.New().String(),
+		Enabled:           true,
+		CreatedAt:         time.Now().UTC().Format(time.RFC3339),
+		Priority:          0,
 	}
 
 	accounts = append(accounts, account)
 	if err := writeAccounts(accounts); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return &account, nil
+	return &account, true, nil
 }
 
 func UpdateAccount(id string, updates map[string]interface{}) (*Account, error) {
@@ -154,12 +313,44 @@ func UpdateAccount(id string, updates map[string]interface{}) (*Account, error) 
 			}
 			if v, ok := updates["githubToken"].(string); ok {
 				accounts[i].GithubToken = v
+				accounts[i].BlockedModels = nil
+			}
+			if v, ok := updates["githubLogin"].(string); ok {
+				accounts[i].GithubLogin = v
+			}
+			if v, ok := updates["githubUserId"]; ok {
+				switch iv := v.(type) {
+				case float64:
+					accounts[i].GithubUserID = int64(iv)
+				case int64:
+					accounts[i].GithubUserID = iv
+				case int:
+					accounts[i].GithubUserID = int64(iv)
+				}
 			}
 			if v, ok := updates["accountType"].(string); ok {
 				accounts[i].AccountType = v
 			}
 			if v, ok := updates["enabled"].(bool); ok {
 				accounts[i].Enabled = v
+			}
+			if v, ok := updates["probeStatus"].(string); ok {
+				accounts[i].ProbeStatus = v
+			}
+			if v, ok := updates["probeCheckedAt"].(string); ok {
+				accounts[i].ProbeCheckedAt = v
+			}
+			if v, ok := updates["probeError"].(string); ok {
+				accounts[i].ProbeError = v
+			}
+			if v, ok := updates["blockedModels"]; ok {
+				accounts[i].BlockedModels = stringSliceFromValue(v)
+			}
+			if v, ok := updates["supportedModels"]; ok {
+				accounts[i].SupportedModels = stringSliceFromValue(v)
+			}
+			if v, ok := updates["unsupportedModels"]; ok {
+				accounts[i].UnsupportedModels = stringSliceFromValue(v)
 			}
 			if v, ok := updates["priority"]; ok {
 				switch pv := v.(type) {

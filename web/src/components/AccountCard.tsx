@@ -1,6 +1,7 @@
 import { useState } from "react"
 
 import { api, type Account, type UsageData } from "../api"
+import { copyText } from "../clipboard"
 import { useT } from "../i18n"
 
 function StatusBadge({ status }: { status: string }) {
@@ -216,6 +217,7 @@ function AccountActions({
 }) {
   const [actionLoading, setActionLoading] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
+  const [copiedLink, setCopiedLink] = useState(false)
   const t = useT()
 
   const handleAction = async (action: () => Promise<unknown>) => {
@@ -240,13 +242,30 @@ function AccountActions({
     setConfirmDelete(false)
   }
 
+  const handleCopyReauthLink = async () => {
+    setActionLoading(true)
+    try {
+      const result = await api.createPublicReauthSession(account.id)
+      copyText(result.sessionUrl)
+      setCopiedLink(true)
+      setTimeout(() => setCopiedLink(false), 1500)
+    } catch (err) {
+      console.error("Failed to create public reauth session:", err)
+    } finally {
+      setActionLoading(false)
+    }
+  }
+
   return (
-    <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
+    <div style={{ display: "flex", gap: 8, flexShrink: 0, flexWrap: "wrap", justifyContent: "flex-end" }}>
       {status === "running" && (
-        <button onClick={onToggleUsage} disabled={usageLoading}>
+        <button onClick={onToggleUsage} disabled={usageLoading || actionLoading}>
           {usageLoading ? "..." : showUsage ? t("hideUsage") : t("usage")}
         </button>
       )}
+      <button onClick={() => void handleAction(() => api.reprobeAccount(account.id))} disabled={actionLoading}>
+        {actionLoading ? "..." : "Reprobe"}
+      </button>
       {status === "running" ?
         <button
           onClick={() => void handleAction(() => api.stopInstance(account.id))}
@@ -262,6 +281,9 @@ function AccountActions({
           {actionLoading ? t("starting") : t("start")}
         </button>
       }
+      <button onClick={() => void handleCopyReauthLink()} disabled={actionLoading}>
+        {copiedLink ? "Copied link" : "Reauth Link"}
+      </button>
       <button
         className="danger"
         onClick={() => void handleDelete()}
@@ -332,6 +354,35 @@ function EndpointsPanel({ apiKey, proxyPort }: { apiKey: string; proxyPort: numb
             </span>
           )
         })}
+      </div>
+    </div>
+  )
+}
+
+function ModelCapabilityChips({ title, models, color }: { title: string; models?: string[]; color: string }) {
+  if (!models || models.length === 0) {
+    return null
+  }
+  return (
+    <div style={{ marginTop: 8 }}>
+      <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 6 }}>{title}</div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+        {models.map((model) => (
+          <span
+            key={model}
+            style={{
+              fontSize: 11,
+              padding: "2px 8px",
+              borderRadius: 999,
+              background: "var(--bg)",
+              border: `1px solid ${color}`,
+              color,
+              fontFamily: "monospace",
+            }}
+          >
+            {model}
+          </span>
+        ))}
       </div>
     </div>
   )
@@ -430,11 +481,22 @@ export function AccountCard({ account, proxyPort, onRefresh }: Props) {
           </div>
           <div style={{ fontSize: 13, color: "var(--text-muted)" }}>
             {account.user?.login ? `@${account.user.login} · ` : ""}
-            {account.accountType}
+            {account.accountType || "type pending"}
+            {account.probeCheckedAt ? ` · checked ${new Date(account.probeCheckedAt).toLocaleString()}` : ""}
           </div>
           {account.error && (
             <div style={{ fontSize: 12, color: "var(--red)", marginTop: 4 }}>
               {t("error")} {account.error}
+            </div>
+          )}
+          {!account.error && account.probeStatus === "failed" && account.probeError && (
+            <div style={{ fontSize: 12, color: "var(--red)", marginTop: 4 }}>
+              Premium probe failed: {account.probeError}
+            </div>
+          )}
+          {account.probeStatus === "passed" && (
+            <div style={{ fontSize: 12, color: "var(--green)", marginTop: 4 }}>
+              Premium-ready models: {(account.supportedModels && account.supportedModels.length > 0) ? account.supportedModels.join(", ") : "none recorded"}
             </div>
           )}
         </div>
@@ -503,6 +565,8 @@ export function AccountCard({ account, proxyPort, onRefresh }: Props) {
         </span>
       </div>
 
+      <ModelCapabilityChips title="Supported premium models" models={account.supportedModels} color="var(--green)" />
+      <ModelCapabilityChips title="Blocked / unsupported premium models" models={account.unsupportedModels} color="var(--red)" />
       <ApiKeyPanel apiKey={account.apiKey} onRegenerate={handleRegenerate} />
       {status === "running" && (
         <EndpointsPanel apiKey={account.apiKey} proxyPort={proxyPort} />

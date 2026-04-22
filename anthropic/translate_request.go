@@ -54,6 +54,8 @@ func TranslateToOpenAI(payload AnthropicMessagesPayload) ChatCompletionsPayload 
 
 	// Convert tools
 	if len(payload.Tools) > 0 {
+		parallelToolCalls := false
+		result.ParallelToolCalls = &parallelToolCalls
 		for _, tool := range payload.Tools {
 			result.Tools = append(result.Tools, OpenAITool{
 				Type: "function",

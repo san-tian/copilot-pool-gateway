@@ -27,6 +27,11 @@ export interface Account {
   enabled: boolean
   createdAt: string
   priority: number
+  probeStatus?: "passed" | "failed"
+  probeCheckedAt?: string
+  probeError?: string
+  supportedModels?: string[]
+  unsupportedModels?: string[]
   status?: "running" | "stopped" | "error"
   error?: string
   user?: { login: string } | null
@@ -81,6 +86,41 @@ export interface ConfigResponse {
   needsSetup: boolean
 }
 
+export interface PublicReauthSession {
+  id: string
+  accountName: string
+  status: string
+  userCode?: string
+  verificationUri?: string
+  expiresAt: string
+  completedAt?: string
+  error?: string
+}
+
+export interface PublicReauthSessionCreateResponse {
+  id: string
+  sessionUrl: string
+  expiresAt: string
+}
+
+export interface PublicAuthSession {
+  sessionId: string
+  status: string
+  userCode?: string
+  verificationUri?: string
+  expiresAt?: string
+  error?: string
+}
+
+export interface AccountProbeResult {
+  success: boolean
+  accountType?: string
+  error?: string
+  checkedAt: string
+  supportedModels?: string[]
+  unsupportedModels?: string[]
+}
+
 export interface BatchUsageItem {
   accountId: string
   name: string
@@ -126,6 +166,20 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   return res.json() as Promise<T>
 }
 
+
+async function publicRequest<T>(path: string, options?: RequestInit): Promise<T> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...(options?.headers as Record<string, string>),
+  }
+  const res = await fetch(`${BASE}${path}`, { ...options, headers })
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as ErrorBody
+    throw new Error(body.error ?? `HTTP ${res.status}`)
+  }
+  return res.json() as Promise<T>
+}
+
 export const api = {
   getConfig: () => request<ConfigResponse>("/config"),
 
@@ -141,6 +195,28 @@ export const api = {
       body: JSON.stringify({ username, password }),
     }),
 
+
+  getPublicReauthSession: (sessionId: string) =>
+    publicRequest<PublicReauthSession>(`/public/reauth/${sessionId}`),
+
+  startPublicReauthSession: (sessionId: string) =>
+    publicRequest<PublicReauthSession>(`/public/reauth/${sessionId}/start`, { method: "POST" }),
+
+  pollPublicReauthSession: (sessionId: string) =>
+    publicRequest<PublicReauthSession>(`/public/reauth/${sessionId}/poll`),
+
+  startPublicAuth: () =>
+    publicRequest<PublicAuthSession>("/public/auth/start", { method: "POST" }),
+
+  pollPublicAuth: (sessionId: string) =>
+    publicRequest<PublicAuthSession>(`/public/auth/poll/${sessionId}`),
+
+  completePublicAuth: (data: { sessionId: string }) =>
+    publicRequest<{ account: Account; created: boolean; probe?: AccountProbeResult }>("/public/auth/complete", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+
   checkAuth: () => request<{ ok: boolean }>("/auth/check"),
 
   getAccounts: () => request<Array<Account>>("/accounts"),
@@ -150,6 +226,9 @@ export const api = {
 
   startInstance: (id: string) =>
     request<{ status: string }>(`/accounts/${id}/start`, { method: "POST" }),
+
+  reprobeAccount: (id: string) =>
+    request<{ account: Account; probe?: AccountProbeResult }>(`/accounts/${id}/reprobe`, { method: "POST" }),
 
   stopInstance: (id: string) =>
     request<{ status: string }>(`/accounts/${id}/stop`, { method: "POST" }),
@@ -161,6 +240,10 @@ export const api = {
   regenerateKey: (id: string) =>
     request<Account>(`/accounts/${id}/regenerate-key`, { method: "POST" }),
 
+
+  createPublicReauthSession: (id: string) =>
+    request<PublicReauthSessionCreateResponse>(`/accounts/${id}/public-reauth-session`, { method: "POST" }),
+
   startDeviceCode: () =>
     request<DeviceCodeResponse>("/auth/device-code", { method: "POST" }),
 
@@ -170,7 +253,6 @@ export const api = {
   completeAuth: (data: {
     sessionId: string
     name: string
-    accountType: string
   }) =>
     request<Account>("/auth/complete", {
       method: "POST",

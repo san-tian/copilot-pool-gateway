@@ -77,9 +77,7 @@ func main() {
 	go func() {
 		defer wg.Done()
 		proxyEngine := gin.New()
-		if *verbose {
-			proxyEngine.Use(gin.Logger())
-		}
+		proxyEngine.Use(gin.Logger())
 		proxyEngine.Use(gin.Recovery())
 
 		handler.RegisterProxy(proxyEngine)

@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useState } from "react"
 
 import { api, getSessionToken, setSessionToken, type Account, type BatchUsageItem, type CopilotModel, type ModelMapping, type PoolConfig, type ProxySettings, type ProxyUsageSnapshot } from "./api"
+import { copyText } from "./clipboard"
 import { AccountCard } from "./components/AccountCard"
 import { AddAccountForm } from "./components/AddAccountForm"
+import { PublicReauthPage } from "./components/PublicReauthPage"
+import { PublicSupplierAuthPage } from "./components/PublicSupplierAuthPage"
 import { useLocale, useT } from "./i18n"
 
 type AuthState = "loading" | "setup" | "login" | "authed"
@@ -839,6 +842,7 @@ function Dashboard() {
   const [proxyPort, setProxyPort] = useState(4141)
   const [pool, setPool] = useState<PoolConfig>({ enabled: false, strategy: "round-robin" } as PoolConfig)
   const [proxySettings, setProxySettings] = useState<ProxySettings>({ proxyURL: "" })
+  const [copiedSupplierLink, setCopiedSupplierLink] = useState(false)
   const t = useT()
 
   const refresh = useCallback(async () => {
@@ -858,6 +862,11 @@ function Dashboard() {
 
   const handleAdd = async () => { setShowForm(false); await refresh() }
   const handleLogout = () => { setSessionToken(""); window.location.reload() }
+  const handleCopySupplierLink = () => {
+    copyText(`${window.location.protocol}//${window.location.host}/supplier-auth`)
+    setCopiedSupplierLink(true)
+    setTimeout(() => setCopiedSupplierLink(false), 1500)
+  }
 
   return (
     <div style={{ maxWidth: 960, margin: "0 auto", padding: "24px 16px" }}>
@@ -868,6 +877,7 @@ function Dashboard() {
         </div>
         <div style={{ display: "flex", gap: 8 }}>
           <LanguageSwitcher />
+          <button onClick={handleCopySupplierLink}>{copiedSupplierLink ? "Copied supplier link" : "Supplier Auth Link"}</button>
           <button className="primary" onClick={() => setShowForm(!showForm)}>{showForm ? t("cancel") : t("addAccount")}</button>
           <button onClick={handleLogout}>{t("logout")}</button>
         </div>
@@ -886,7 +896,18 @@ function Dashboard() {
   )
 }
 
+function getPublicReauthId(): string | null {
+  const match = window.location.pathname.match(/^\/reauth\/([^/]+)$/)
+  return match ? decodeURIComponent(match[1]) : null
+}
+
+function isPublicSupplierAuthPath(): boolean {
+  return window.location.pathname === "/supplier-auth"
+}
+
 export function App() {
+  const publicReauthId = getPublicReauthId()
+  const isPublicSupplierAuth = isPublicSupplierAuthPath()
   const [authState, setAuthState] = useState<AuthState>("loading")
   const t = useT()
 
@@ -904,6 +925,8 @@ export function App() {
     })()
   }, [])
 
+  if (publicReauthId) return <PublicReauthPage sessionId={publicReauthId} />
+  if (isPublicSupplierAuth) return <PublicSupplierAuthPage />
   if (authState === "loading") return <div style={{ color: "var(--text-muted)", textAlign: "center", padding: 120 }}>{t("loading")}</div>
   if (authState === "setup") return <SetupForm onComplete={() => setAuthState("authed")} />
   if (authState === "login") return <LoginForm onLogin={() => setAuthState("authed")} />

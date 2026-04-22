@@ -67,6 +67,12 @@ func RegisterConsoleAPI(r *gin.Engine, proxyPort int) {
 
 	api.POST("/auth/setup", handleSetup)
 	api.POST("/auth/login", handleLogin)
+	api.GET("/public/reauth/:sessionId", handleGetPublicReauthSession)
+	api.POST("/public/reauth/:sessionId/start", handleStartPublicReauth)
+	api.GET("/public/reauth/:sessionId/poll", handlePollPublicReauth)
+	api.POST("/public/auth/start", handleStartPublicAuth)
+	api.GET("/public/auth/poll/:sessionId", handlePollPublicAuth)
+	api.POST("/public/auth/complete", handleCompletePublicAuth)
 
 	// Protected endpoints
 	protected := api.Group("")
@@ -85,8 +91,10 @@ func RegisterConsoleAPI(r *gin.Engine, proxyPort int) {
 	protected.DELETE("/accounts/:id", handleDeleteAccount)
 	protected.POST("/accounts/:id/regenerate-key", handleRegenerateKey)
 	protected.POST("/accounts/:id/start", handleStartAccount)
+	protected.POST("/accounts/:id/reprobe", handleReprobeAccount)
 	protected.POST("/accounts/:id/stop", handleStopAccount)
 	protected.GET("/accounts/:id/usage", handleGetAccountUsage)
+	protected.POST("/accounts/:id/public-reauth-session", handleCreatePublicReauthSession)
 
 	// Device flow auth
 	protected.POST("/auth/device-code", handleDeviceCode)
@@ -351,6 +359,25 @@ func handleStartAccount(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "running"})
 }
 
+func handleReprobeAccount(c *gin.Context) {
+	id := c.Param("id")
+	account, err := store.GetAccount(id)
+	if err != nil || account == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "account not found"})
+		return
+	}
+
+	updated, probe, err := instance.ReprobeAccount(*account)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if updated == nil {
+		updated = account
+	}
+	c.JSON(http.StatusOK, gin.H{"account": updated, "probe": probe})
+}
+
 func handleStopAccount(c *gin.Context) {
 	id := c.Param("id")
 	instance.StopInstance(id)
@@ -399,40 +426,37 @@ func handlePollSession(c *gin.Context) {
 
 func handleCompleteAuth(c *gin.Context) {
 	var body struct {
-		SessionID   string `json:"sessionId"`
-		Name        string `json:"name"`
-		AccountType string `json:"accountType"`
+		SessionID string `json:"sessionId"`
+		Name      string `json:"name"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
 		return
 	}
 
-	session := auth.GetSession(body.SessionID)
-	if session == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "session not found"})
-		return
-	}
-	if session.Status != "completed" || session.AccessToken == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "auth not completed"})
-		return
-	}
-
-	if body.AccountType == "" {
-		body.AccountType = "individual"
-	}
 	if body.Name == "" {
 		body.Name = "GitHub Account"
 	}
 
-	account, err := store.AddAccount(body.Name, session.AccessToken, body.AccountType)
+	result, err := completeSessionToAccount(body.SessionID, body.Name, "")
 	if err != nil {
+		if err.Error() == "session not found" {
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+			return
+		}
+		if err.Error() == "auth not completed" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
-	auth.CleanupSession(body.SessionID)
-	c.JSON(http.StatusCreated, account)
+	status := http.StatusOK
+	if result.Created {
+		status = http.StatusCreated
+	}
+	c.JSON(status, result.Account)
 }
 
 // --- Pool handlers ---

@@ -146,8 +146,6 @@ function ConfigForm({
   error,
   name,
   setName,
-  accountType,
-  setAccountType,
 }: {
   onSubmit: (e: React.SyntheticEvent) => void
   onCancel: () => void
@@ -155,8 +153,6 @@ function ConfigForm({
   error: string
   name: string
   setName: (v: string) => void
-  accountType: string
-  setAccountType: (v: string) => void
 }) {
   const t = useT()
   return (
@@ -174,17 +170,8 @@ function ConfigForm({
             placeholder={t("accountNamePlaceholder")}
           />
         </div>
-        <div>
-          <label htmlFor="acc-type">{t("accountType")}</label>
-          <select
-            id="acc-type"
-            value={accountType}
-            onChange={(e) => setAccountType(e.target.value)}
-          >
-            <option value="individual">{t("individual")}</option>
-            <option value="business">{t("business")}</option>
-            <option value="enterprise">{t("enterprise")}</option>
-          </select>
+        <div style={{ fontSize: 12, color: "var(--text-muted)" }}>
+          Account type and availability are detected automatically after GitHub authorization.
         </div>
       </div>
       {error && (
@@ -223,7 +210,7 @@ function useAuthFlow(onComplete: () => Promise<void>) {
 
   useEffect(() => cleanup, [cleanup])
 
-  const startAuth = async (name: string, accountType: string) => {
+  const startAuth = async (name: string) => {
     setError("")
     setLoading(true)
     try {
@@ -243,7 +230,6 @@ function useAuthFlow(onComplete: () => Promise<void>) {
               await api.completeAuth({
                 sessionId: result.sessionId,
                 name,
-                accountType,
               })
               setStep("done")
               await onComplete()
@@ -279,7 +265,6 @@ function useAuthFlow(onComplete: () => Promise<void>) {
 
 export function AddAccountForm({ onComplete, onCancel }: Props) {
   const [name, setName] = useState("")
-  const [accountType, setAccountType] = useState("individual")
   const auth = useAuthFlow(onComplete)
   const t = useT()
 
@@ -289,7 +274,7 @@ export function AddAccountForm({ onComplete, onCancel }: Props) {
       auth.setError(t("accountNameRequired"))
       return
     }
-    void auth.startAuth(name.trim(), accountType)
+    void auth.startAuth(name.trim())
   }
 
   if (auth.step === "done") return null
@@ -312,8 +297,6 @@ export function AddAccountForm({ onComplete, onCancel }: Props) {
           error={auth.error}
           name={name}
           setName={setName}
-          accountType={accountType}
-          setAccountType={setAccountType}
         />
       )}
       {auth.step === "authorize" && (

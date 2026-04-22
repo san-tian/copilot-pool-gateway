@@ -183,6 +183,7 @@ type ChatCompletionsPayload struct {
 	Stop                interface{}     `json:"stop,omitempty"`
 	Tools               []OpenAITool    `json:"tools,omitempty"`
 	ToolChoice          interface{}     `json:"tool_choice,omitempty"`
+	ParallelToolCalls   *bool           `json:"parallel_tool_calls,omitempty"`
 	N                   int             `json:"n,omitempty"`
 	User                string          `json:"user,omitempty"`
 }
