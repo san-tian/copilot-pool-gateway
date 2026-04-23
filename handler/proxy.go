@@ -300,6 +300,85 @@ func extractResponseFunctionCallOutputIDs(bodyBytes []byte) []string {
 	return uniqueTrimmedStrings(ids)
 }
 
+// canonicalizeCopilotCallID reverses a downstream agent's "mangled" rewriting
+// of a Copilot function-call id. Some agents (observed with Pi's routing
+// layer) take the upstream-minted `call_<24body>` id, drop the underscore,
+// and append a 12-char routing tag, yielding a 40-char `call<24body><12tag>`
+// form when they later submit the corresponding function_call_output.
+//
+// Leaving the mangled id in place breaks us two ways:
+//  1. Our sticky cache keys on the canonical form the stream capture stored,
+//     so the tag-suffixed id misses and we round-robin to a random account.
+//  2. Upstream Copilot validates every input item's id against its own
+//     function_call history on the chosen connection — the mangled form
+//     never matches, so upstream rejects the continuation with
+//     "input item ID does not belong to this connection" and we fall back
+//     to the lossy orphan-degrade path.
+//
+// Canonicalizing at ingestion makes both problems vanish with a single
+// transform: strip the 12-char tail and reinsert the underscore.
+func canonicalizeCopilotCallID(id string) string {
+	if strings.HasPrefix(id, "call_") {
+		return id
+	}
+	if len(id) != 40 || !strings.HasPrefix(id, "call") {
+		return id
+	}
+	return "call_" + id[4:28]
+}
+
+// rewriteFunctionCallOutputCallIDs parses a /v1/responses request body and
+// canonicalizes every function_call_output.call_id that looks downstream-
+// mangled. Returns the original bytes untouched if the body doesn't parse,
+// carries no rewritable ids, or wasn't actually rewritten.
+func rewriteFunctionCallOutputCallIDs(bodyBytes []byte) []byte {
+	if len(bodyBytes) == 0 {
+		return bodyBytes
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &payload); err != nil {
+		return bodyBytes
+	}
+	rewrite := func(item interface{}) bool {
+		entry, ok := item.(map[string]interface{})
+		if !ok {
+			return false
+		}
+		itemType, _ := entry["type"].(string)
+		if strings.TrimSpace(strings.ToLower(itemType)) != "function_call_output" {
+			return false
+		}
+		callID, _ := entry["call_id"].(string)
+		canonical := canonicalizeCopilotCallID(strings.TrimSpace(callID))
+		if canonical == callID {
+			return false
+		}
+		entry["call_id"] = canonical
+		return true
+	}
+	changed := false
+	switch typed := payload["input"].(type) {
+	case []interface{}:
+		for _, item := range typed {
+			if rewrite(item) {
+				changed = true
+			}
+		}
+	case map[string]interface{}:
+		if rewrite(typed) {
+			changed = true
+		}
+	}
+	if !changed {
+		return bodyBytes
+	}
+	out, err := json.Marshal(payload)
+	if err != nil {
+		return bodyBytes
+	}
+	return out
+}
+
 func uniqueTrimmedStrings(values []string) []string {
 	if len(values) == 0 {
 		return nil
@@ -881,6 +960,7 @@ func proxyResponses(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read request body"})
 		return
 	}
+	bodyBytes = rewriteFunctionCallOutputCallIDs(bodyBytes)
 
 	requestedModel := extractRequestedModel(bodyBytes)
 	previousResponseID := extractPreviousResponseID(bodyBytes)
