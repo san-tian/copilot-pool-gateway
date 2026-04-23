@@ -56,28 +56,22 @@ func RegisterConsoleAPI(r *gin.Engine, proxyPort int) {
 
 	api := r.Group("/api")
 
-	// Public endpoints
-	api.GET("/config", func(c *gin.Context) {
-		needsSetup, _ := store.IsSetupRequired()
-		c.JSON(http.StatusOK, gin.H{
-			"proxyPort":  proxyPort,
-			"needsSetup": needsSetup,
-		})
-	})
+	// Public endpoints — shared with the proxy-port mount (see RegisterProxyPublic).
+	registerPublicConsoleAPI(api, proxyPort)
 
-	api.POST("/auth/setup", handleSetup)
-	api.POST("/auth/login", handleLogin)
-	api.GET("/public/reauth/:sessionId", handleGetPublicReauthSession)
-	api.POST("/public/reauth/:sessionId/start", handleStartPublicReauth)
-	api.GET("/public/reauth/:sessionId/poll", handlePollPublicReauth)
-	api.POST("/public/auth/start", handleStartPublicAuth)
-	api.GET("/public/auth/poll/:sessionId", handlePollPublicAuth)
-	api.POST("/public/auth/complete", handleCompletePublicAuth)
-
-	// Protected endpoints
+	// Protected endpoints — also shared with the proxy-port mount so the admin
+	// console can be reached from :38000 when the user only exposes one port.
 	protected := api.Group("")
 	protected.Use(adminAuthMiddleware())
+	registerProtectedConsoleAPI(protected, proxyPort)
+}
 
+// registerProtectedConsoleAPI mounts the admin-authenticated API endpoints onto
+// the supplied group (expected to already have adminAuthMiddleware applied).
+// Called from both RegisterConsoleAPI (:web-port) and RegisterProxyPublic
+// (:proxy-port) so the SPA served on either port can drive the same admin
+// surface with a single session token.
+func registerProtectedConsoleAPI(protected *gin.RouterGroup, proxyPort int) {
 	protected.GET("/auth/check", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"valid": true})
 	})
@@ -125,6 +119,29 @@ func RegisterConsoleAPI(r *gin.Engine, proxyPort int) {
 
 	// Claude Code command generator
 	protected.POST("/claude-code-command", handleClaudeCodeCommand(proxyPort))
+}
+
+// registerPublicConsoleAPI mounts the API endpoints that must be reachable
+// without an admin session: config probe, setup/login, and the public supplier
+// auth + reauth flows. Called from both the Web Console (:web-port) and the
+// proxy-port public mount so the login and supplier-auth pages work on either.
+func registerPublicConsoleAPI(api *gin.RouterGroup, proxyPort int) {
+	api.GET("/config", func(c *gin.Context) {
+		needsSetup, _ := store.IsSetupRequired()
+		c.JSON(http.StatusOK, gin.H{
+			"proxyPort":  proxyPort,
+			"needsSetup": needsSetup,
+		})
+	})
+
+	api.POST("/auth/setup", handleSetup)
+	api.POST("/auth/login", handleLogin)
+	api.GET("/public/reauth/:sessionId", handleGetPublicReauthSession)
+	api.POST("/public/reauth/:sessionId/start", handleStartPublicReauth)
+	api.GET("/public/reauth/:sessionId/poll", handlePollPublicReauth)
+	api.POST("/public/auth/start", handleStartPublicAuth)
+	api.GET("/public/auth/poll/:sessionId", handlePollPublicAuth)
+	api.POST("/public/auth/complete", handleCompletePublicAuth)
 }
 
 func adminAuthMiddleware() gin.HandlerFunc {
@@ -321,12 +338,20 @@ func handleUpdateAccount(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "account not found"})
 		return
 	}
+	// Admin-triggered disable: evict sticky-cache entries so in-flight codex /
+	// pi sessions see SessionOrphan (410) rather than canonical-but-unavailable
+	// (503). Opportunistic — correctness already holds without this, but it
+	// shortens the "why is this request failing" window the user sees.
+	if enabled, ok := updates["enabled"].(bool); ok && !enabled {
+		instance.EvictAccountContinuationCaches(id)
+	}
 	c.JSON(http.StatusOK, account)
 }
 
 func handleDeleteAccount(c *gin.Context) {
 	id := c.Param("id")
 	instance.StopInstance(id)
+	instance.EvictAccountContinuationCaches(id)
 	if err := store.DeleteAccount(id); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

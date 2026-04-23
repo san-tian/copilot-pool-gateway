@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -108,6 +110,59 @@ func (s *State) Lock()    { s.mu.Lock() }
 func (s *State) Unlock()  { s.mu.Unlock() }
 func (s *State) RLock()   { s.mu.RLock() }
 func (s *State) RUnlock() { s.mu.RUnlock() }
+
+// WorkerPoolMode returns the per-account worker routing mode for /v1/responses.
+// "auto"  (default) — route to account.WorkerURL when set, otherwise direct.
+// "off"           — force direct mode globally regardless of account.WorkerURL.
+func WorkerPoolMode() string {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv("USE_WORKER_POOL")))
+	if v == "off" || v == "disabled" || v == "0" || v == "false" {
+		return "off"
+	}
+	return "auto"
+}
+
+// OrphanPassthrough controls what happens when a /v1/responses request arrives
+// with function_call_output items whose call_ids the router's sticky cache
+// has never seen (the cross-relay migration scenario).
+//
+// "auto" (default) — when a worker-enabled account is available, skip the
+//   410 session_expired check, clear sticky state, and pool-route the request
+//   as a fresh session. Worker translates to stateless chat/completions so
+//   tool_call_ids don't have to match any server-side session. Only kicks in
+//   for fc_id orphans; previous_response_id-only orphans (truncated input
+//   depending on server-side history) still 410 because input is unrecoverable.
+// "off" — preserve historical behavior: 410 on any orphan, unless the client
+//   set X-Copilot-Continuation-Degrade: orphan.
+func OrphanPassthrough() string {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv("ORPHAN_PASSTHROUGH")))
+	if v == "off" || v == "disabled" || v == "0" || v == "false" {
+		return "off"
+	}
+	return "auto"
+}
+
+// ResponsesOrphanTranslate controls whether orphan /v1/responses requests are
+// translated in-process to chat/completions and routed to the worker's
+// /v1/chat/completions endpoint, with the chat SSE stream wrapped back into
+// Responses SSE events on the way out. This keeps the stateful /v1/responses
+// upstream out of the cross-relay migration path entirely — Copilot's
+// chat/completions endpoint does not session-validate tool_call_ids, so
+// orphan fc_ids pass through cleanly.
+//
+// "on" — translate orphan /v1/responses → chat/completions in Go before
+//        the worker call; wrap the chat SSE reply back into Responses SSE.
+//        Only effective when the selected account has a WorkerURL.
+// "off" (default) — orphan passthrough forwards the raw Responses payload
+//                   to the worker's /v1/responses, which proxies to Copilot
+//                   and can 401 on unknown fc_ids.
+func ResponsesOrphanTranslate() string {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv("RESPONSES_ORPHAN_TRANSLATE")))
+	if v == "on" || v == "enabled" || v == "1" || v == "true" {
+		return "on"
+	}
+	return "off"
+}
 
 func CopilotBaseURL(accountType string) string {
 	if accountType == "" || accountType == "individual" {

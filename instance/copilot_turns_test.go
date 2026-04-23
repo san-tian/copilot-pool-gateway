@@ -450,6 +450,120 @@ func TestLookupResponseFunctionCallAccountReturnsStoredAccount(t *testing.T) {
 	}
 }
 
+func TestResolveResponseFunctionCallSessionCanonical(t *testing.T) {
+	resetCopilotTurnCaches()
+
+	ctx := newCopilotTurnContext()
+	storeResponseFunctionCallTurnContext("acct-1", []string{"call_1", "call_2", "call_3"}, ctx)
+
+	result := ResolveResponseFunctionCallSession([]string{"call_1", "call_2", "call_3"})
+	if result.Kind != SessionCanonical {
+		t.Fatalf("expected SessionCanonical, got %v", result.Kind)
+	}
+	if result.AccountID != "acct-1" {
+		t.Fatalf("expected AccountID acct-1, got %q", result.AccountID)
+	}
+	if result.HitCount != 3 || result.MissCount != 0 {
+		t.Fatalf("expected hit=3 miss=0, got hit=%d miss=%d", result.HitCount, result.MissCount)
+	}
+}
+
+func TestResolveResponseFunctionCallSessionCanonicalPartialMiss(t *testing.T) {
+	resetCopilotTurnCaches()
+
+	ctx := newCopilotTurnContext()
+	storeResponseFunctionCallTurnContext("acct-1", []string{"call_1"}, ctx)
+
+	// call_2 and call_3 were evicted / never stored — canonical still wins
+	// because every hit agrees on acct-1.
+	result := ResolveResponseFunctionCallSession([]string{"call_1", "call_2", "call_3"})
+	if result.Kind != SessionCanonical {
+		t.Fatalf("expected SessionCanonical on partial miss, got %v", result.Kind)
+	}
+	if result.AccountID != "acct-1" {
+		t.Fatalf("expected AccountID acct-1, got %q", result.AccountID)
+	}
+	if result.HitCount != 1 || result.MissCount != 2 {
+		t.Fatalf("expected hit=1 miss=2, got hit=%d miss=%d", result.HitCount, result.MissCount)
+	}
+}
+
+func TestResolveResponseFunctionCallSessionSplit(t *testing.T) {
+	resetCopilotTurnCaches()
+
+	ctx1 := newCopilotTurnContext()
+	ctx2 := newCopilotTurnContext()
+	storeResponseFunctionCallTurnContext("acct-1", []string{"call_1", "call_2"}, ctx1)
+	storeResponseFunctionCallTurnContext("acct-2", []string{"call_3"}, ctx2)
+
+	result := ResolveResponseFunctionCallSession([]string{"call_1", "call_2", "call_3"})
+	if result.Kind != SessionSplit {
+		t.Fatalf("expected SessionSplit, got %v", result.Kind)
+	}
+	if result.AccountID != "" {
+		t.Fatalf("expected AccountID empty for split, got %q", result.AccountID)
+	}
+	if len(result.SplitAccounts) != 2 {
+		t.Fatalf("expected 2 split accounts, got %v", result.SplitAccounts)
+	}
+	// Split accounts must be sorted for stable diagnostics.
+	if result.SplitAccounts[0] != "acct-1" || result.SplitAccounts[1] != "acct-2" {
+		t.Fatalf("expected split accounts sorted [acct-1 acct-2], got %v", result.SplitAccounts)
+	}
+	if result.HitCount != 3 || result.MissCount != 0 {
+		t.Fatalf("expected hit=3 miss=0, got hit=%d miss=%d", result.HitCount, result.MissCount)
+	}
+}
+
+func TestResolveResponseFunctionCallSessionOrphan(t *testing.T) {
+	resetCopilotTurnCaches()
+
+	result := ResolveResponseFunctionCallSession([]string{"call_unknown_1", "call_unknown_2"})
+	if result.Kind != SessionOrphan {
+		t.Fatalf("expected SessionOrphan, got %v", result.Kind)
+	}
+	if result.AccountID != "" {
+		t.Fatalf("expected AccountID empty for orphan, got %q", result.AccountID)
+	}
+	if result.HitCount != 0 || result.MissCount != 2 {
+		t.Fatalf("expected hit=0 miss=2, got hit=%d miss=%d", result.HitCount, result.MissCount)
+	}
+}
+
+func TestResolveResponseFunctionCallSessionEmptyInput(t *testing.T) {
+	resetCopilotTurnCaches()
+
+	result := ResolveResponseFunctionCallSession(nil)
+	if result.Kind != SessionOrphan {
+		t.Fatalf("expected SessionOrphan on nil input, got %v", result.Kind)
+	}
+
+	result = ResolveResponseFunctionCallSession([]string{"", "  "})
+	if result.Kind != SessionOrphan {
+		t.Fatalf("expected SessionOrphan on whitespace-only input, got %v", result.Kind)
+	}
+}
+
+func TestStashResponseFunctionCallTurnContextInMemoryBinds(t *testing.T) {
+	resetCopilotTurnCaches()
+
+	ctx := newCopilotTurnContext()
+	stashResponseFunctionCallTurnContextInMemory("acct-1", []string{"call_1", "call_2"}, ctx)
+
+	result := ResolveResponseFunctionCallSession([]string{"call_1", "call_2"})
+	if result.Kind != SessionCanonical || result.AccountID != "acct-1" {
+		t.Fatalf("expected canonical acct-1 after stash, got kind=%v account=%q", result.Kind, result.AccountID)
+	}
+	// Confirm the stored context is recoverable (same as the full store path).
+	recovered, ok := loadResponseFunctionCallTurnContext("acct-1", []string{"call_1"})
+	if !ok {
+		t.Fatal("expected stashed context to be loadable")
+	}
+	if recovered != ctx {
+		t.Fatalf("expected recovered ctx %+v, got %+v", ctx, recovered)
+	}
+}
+
 func TestLookupResponseTurnAccountReturnsStoredAccount(t *testing.T) {
 	resetCopilotTurnCaches()
 

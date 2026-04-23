@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"copilot-go/anthropic"
 	"copilot-go/config"
@@ -133,7 +134,12 @@ func degradedInputShape(body []byte) string {
 	return strings.Join(parts, " ")
 }
 
-// RegisterProxy sets up the proxy server routes.
+// RegisterProxy sets up the proxy server's authenticated API routes.
+//
+// proxyAuth is scoped to a sub-group (not the engine) so that public routes
+// mounted on the same engine by RegisterProxyPublic — the SPA aliases and the
+// small /api subset needed by the login / supplier-auth pages — are not forced
+// through Bearer-token auth meant for LLM API callers.
 func RegisterProxy(r *gin.Engine) {
 	// Initialize rate limiter from environment.
 	instance.InitRateLimiter()
@@ -143,24 +149,25 @@ func RegisterProxy(r *gin.Engine) {
 		instance.SetPerAccountRPM(poolCfg.RateLimitRPM)
 	}
 
-	r.Use(proxyAuth())
+	api := r.Group("")
+	api.Use(proxyAuth())
 
 	// OpenAI compatible endpoints
-	r.POST("/chat/completions", proxyCompletions)
-	r.POST("/v1/chat/completions", proxyCompletions)
-	r.GET("/models", proxyModels)
-	r.GET("/v1/models", proxyModels)
-	r.POST("/embeddings", proxyEmbeddings)
-	r.POST("/v1/embeddings", proxyEmbeddings)
+	api.POST("/chat/completions", proxyCompletions)
+	api.POST("/v1/chat/completions", proxyCompletions)
+	api.GET("/models", proxyModels)
+	api.GET("/v1/models", proxyModels)
+	api.POST("/embeddings", proxyEmbeddings)
+	api.POST("/v1/embeddings", proxyEmbeddings)
 
 	// Anthropic compatible endpoints
-	r.POST("/v1/messages", proxyMessages)
-	r.POST("/v1/messages/count_tokens", proxyCountTokens)
+	api.POST("/v1/messages", proxyMessages)
+	api.POST("/v1/messages/count_tokens", proxyCountTokens)
 
 	// OpenAI Responses API endpoint
-	r.POST("/responses/compact", proxyResponsesCompact)
-	r.POST("/v1/responses/compact", proxyResponsesCompact)
-	r.POST("/v1/responses", proxyResponses)
+	api.POST("/responses/compact", proxyResponsesCompact)
+	api.POST("/v1/responses/compact", proxyResponsesCompact)
+	api.POST("/v1/responses", proxyResponses)
 }
 
 func proxyAuth() gin.HandlerFunc {
@@ -328,9 +335,18 @@ func canonicalizeCopilotCallID(id string) string {
 }
 
 // rewriteFunctionCallOutputCallIDs parses a /v1/responses request body and
-// canonicalizes every function_call_output.call_id that looks downstream-
-// mangled. Returns the original bytes untouched if the body doesn't parse,
-// carries no rewritable ids, or wasn't actually rewritten.
+// canonicalizes every downstream-mangled call_id on both function_call /
+// function_call_output AND custom_tool_call / custom_tool_call_output items.
+// Covering only one half of a pair breaks the pair validation upstream
+// performs at continuation — a canonical output id with a still-mangled call
+// id yields "input item ID does not belong to this connection" (or the older
+// "No tool output found for function call <mangled-id>") — so the rewrite
+// must span every call_id-bearing item type. custom_tool_call items come from
+// Codex-style custom tools and exhibit the same 40-char mangling from the
+// downstream passthrough path; skipping them triggered the same orphan-
+// continuation → degrade → retry loop that motivated the original fix.
+// Returns the original bytes untouched if the body doesn't parse, carries no
+// rewritable ids, or wasn't actually rewritten.
 func rewriteFunctionCallOutputCallIDs(bodyBytes []byte) []byte {
 	if len(bodyBytes) == 0 {
 		return bodyBytes
@@ -345,7 +361,11 @@ func rewriteFunctionCallOutputCallIDs(bodyBytes []byte) []byte {
 			return false
 		}
 		itemType, _ := entry["type"].(string)
-		if strings.TrimSpace(strings.ToLower(itemType)) != "function_call_output" {
+		normalized := strings.TrimSpace(strings.ToLower(itemType))
+		switch normalized {
+		case "function_call", "function_call_output",
+			"custom_tool_call", "custom_tool_call_output":
+		default:
 			return false
 		}
 		callID, _ := entry["call_id"].(string)
@@ -512,6 +532,114 @@ func resolveState(c *gin.Context, exclude map[string]bool, requestedModel string
 		return nil
 	}
 	return &resolvedAccount{State: state, AccountID: aid}
+}
+
+// canOrphanPassthrough reports whether an fc-id orphan can be safely routed
+// as a fresh request. Pool mode: at least one enabled, non-blocked,
+// worker-enabled, non-excluded account must exist. Single-account mode: the
+// caller's specific account must have a WorkerURL and support the model.
+// Returns false when no worker-capable target is reachable — in which case
+// we fall back to emitting 410 because direct-mode Responses upstream would
+// reject the cross-relay call_ids.
+func canOrphanPassthrough(c *gin.Context, requestedModel string, exclude map[string]bool) bool {
+	isPool, _ := c.Get("isPool")
+	if isPool == true {
+		accounts, err := store.GetEnabledAccounts()
+		if err != nil {
+			return false
+		}
+		blocked := store.GetBlockedAccountIDs(requestedModel)
+		for _, a := range accounts {
+			if strings.TrimSpace(a.WorkerURL) == "" {
+				continue
+			}
+			if exclude[a.ID] || blocked[a.ID] {
+				continue
+			}
+			if instance.GetInstanceState(a.ID) == nil {
+				continue
+			}
+			return true
+		}
+		return false
+	}
+	accountID, exists := c.Get("accountID")
+	if !exists {
+		return false
+	}
+	aid, _ := accountID.(string)
+	if aid == "" {
+		return false
+	}
+	acct, err := store.GetAccount(aid)
+	if err != nil || acct == nil || strings.TrimSpace(acct.WorkerURL) == "" {
+		return false
+	}
+	if store.IsModelBlocked(aid, requestedModel) {
+		return false
+	}
+	if instance.GetInstanceState(aid) == nil {
+		return false
+	}
+	return true
+}
+
+// workerDisabledAccountIDs returns enabled account IDs that have no WorkerURL.
+// Used to exclude direct-mode-only accounts from pool routing in the orphan
+// passthrough branch, so the pool only picks worker-capable targets.
+func workerDisabledAccountIDs(requestedModel string) []string {
+	accounts, err := store.GetEnabledAccounts()
+	if err != nil {
+		return nil
+	}
+	out := make([]string, 0)
+	for _, a := range accounts {
+		if strings.TrimSpace(a.WorkerURL) == "" {
+			out = append(out, a.ID)
+		}
+	}
+	return out
+}
+
+// orphanTranslateCompatibleModel reports whether the requested model can be
+// served via Copilot's /v1/chat/completions endpoint. The gpt-5 family and
+// Anthropic models are rejected by Copilot with
+//
+//	{"error":{"message":"Please use `/v1/responses` or `/v1/messages` API"}}
+//
+// so we must NOT translate their orphan requests to chat/completions — a
+// separate /v1/messages translator handles them. Everything else is attempted
+// via chat/completions; if a model we haven't seen before 400s, the body-snippet
+// log in DoOrphanTranslateResponsesProxy surfaces it for blocklist expansion.
+func orphanTranslateCompatibleModel(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	if m == "" {
+		return false
+	}
+	for _, prefix := range []string{"gpt-5", "claude-"} {
+		if strings.HasPrefix(m, prefix) {
+			return false
+		}
+	}
+	return true
+}
+
+// orphanTranslateMessagesModel reports whether the requested model should be
+// served via Copilot's /v1/messages endpoint (Anthropic-compat, stateless).
+// This covers exactly the gpt-5 family and Claude models — the families that
+// /v1/chat/completions rejects with the "Please use /v1/responses or /v1/messages"
+// error. Everything else stays on the chat translator path.
+func orphanTranslateMessagesModel(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	if m == "" {
+		return false
+	}
+	for _, prefix := range []string{"gpt-5", "claude-"} {
+		if strings.HasPrefix(m, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // isRetryableStatus returns true for HTTP status codes that warrant a retry with a different account.
@@ -948,6 +1076,165 @@ func proxyResponsesCompact(c *gin.Context) {
 	}
 }
 
+// continuationBindingKind classifies how a /v1/responses continuation request
+// maps onto the sticky cache before we pick an upstream account. The four
+// outcomes are disjoint and drive deterministic routing: canonical → single
+// pinned account, anything else → typed HTTP error (unless the caller opts
+// in to lossy orphan degrade).
+type continuationBindingKind int
+
+const (
+	// continuationBindingCanonical — every cache hit agrees on one account
+	// and that account is currently usable for the requested model. The loop
+	// pins this account for all attempts; no cross-account rollover.
+	continuationBindingCanonical continuationBindingKind = iota
+	// continuationBindingAccountUnavailable — cache points at a single
+	// account but it's currently model-blocked or its instance is not
+	// running. 503: the user must wait or restart; we will not silently
+	// rotate to a different account (which would orphan on upstream).
+	continuationBindingAccountUnavailable
+	// continuationBindingSplit — two or more accounts each own a subset of
+	// this request's function_call_output call_ids. Upstream validation is
+	// all-or-nothing per account, so no dispatch is safe. 409: the user
+	// must restart.
+	continuationBindingSplit
+	// continuationBindingOrphan — no cache entry at all (new session, TTL
+	// expiry, or eviction on account removal). 410 by default; if the
+	// caller sets X-Copilot-Continuation-Degrade: orphan, we textify the
+	// fc history and fall through to first-turn routing.
+	continuationBindingOrphan
+)
+
+type continuationBindingResult struct {
+	Kind          continuationBindingKind
+	Resolved      *resolvedAccount // set when Kind == Canonical
+	AccountID     string           // set when Kind == Canonical or AccountUnavailable
+	SplitAccounts []string         // set when Kind == Split
+	Reason        string           // human-readable diagnostic for logs and 4xx/5xx bodies
+	HitCount      int              // diagnostic: fc cache hits
+	MissCount     int              // diagnostic: fc cache misses
+}
+
+// resolveContinuationBinding classifies a continuation request (prev_id or
+// function_call_output ids present) against the sticky cache without
+// touching any HTTP context. Pure function: the caller decides how to turn
+// the result into a response and does the HTTP work. `previousResponseID`
+// takes precedence over the fc_ids path — if both are set, we bind by
+// prev_id because it's a single-key lookup with stronger semantics.
+func resolveContinuationBinding(previousResponseID string, functionCallOutputIDs []string, requestedModel string) continuationBindingResult {
+	previousResponseID = strings.TrimSpace(previousResponseID)
+	if previousResponseID != "" {
+		accountID, ok := instance.LookupResponsesReplayAccount(previousResponseID)
+		if !ok {
+			accountID, ok = instance.LookupResponseTurnAccount(previousResponseID)
+		}
+		if !ok {
+			return continuationBindingResult{
+				Kind:   continuationBindingOrphan,
+				Reason: fmt.Sprintf("previous_response_id %q was not found or has expired", previousResponseID),
+			}
+		}
+		return canonicalAccountBinding(accountID, requestedModel)
+	}
+	if len(functionCallOutputIDs) == 0 {
+		return continuationBindingResult{Kind: continuationBindingOrphan, Reason: "no previous_response_id and no function_call_output ids"}
+	}
+	session := instance.ResolveResponseFunctionCallSession(functionCallOutputIDs)
+	switch session.Kind {
+	case instance.SessionCanonical:
+		binding := canonicalAccountBinding(session.AccountID, requestedModel)
+		binding.HitCount = session.HitCount
+		binding.MissCount = session.MissCount
+		return binding
+	case instance.SessionSplit:
+		return continuationBindingResult{
+			Kind:          continuationBindingSplit,
+			SplitAccounts: session.SplitAccounts,
+			Reason:        fmt.Sprintf("function_call_output history spans %d accounts: %s", len(session.SplitAccounts), strings.Join(session.SplitAccounts, ", ")),
+			HitCount:      session.HitCount,
+			MissCount:     session.MissCount,
+		}
+	default: // SessionOrphan
+		return continuationBindingResult{
+			Kind:     continuationBindingOrphan,
+			Reason:   fmt.Sprintf("no function_call_output call_id matches any known session (hits=0 misses=%d)", session.MissCount),
+			HitCount: 0,
+			MissCount: session.MissCount,
+		}
+	}
+}
+
+// canonicalAccountBinding turns a canonical accountID into either a
+// fully-resolved Canonical binding or an AccountUnavailable binding with
+// the specific reason. Called from both the prev_id and fc_ids paths in
+// resolveContinuationBinding.
+func canonicalAccountBinding(accountID, requestedModel string) continuationBindingResult {
+	if store.IsModelBlocked(accountID, requestedModel) {
+		return continuationBindingResult{
+			Kind:      continuationBindingAccountUnavailable,
+			AccountID: accountID,
+			Reason:    fmt.Sprintf("account %s is paused for model %s", accountID, requestedModel),
+		}
+	}
+	state := instance.GetInstanceState(accountID)
+	if state == nil {
+		return continuationBindingResult{
+			Kind:      continuationBindingAccountUnavailable,
+			AccountID: accountID,
+			Reason:    fmt.Sprintf("account %s instance is not running", accountID),
+		}
+	}
+	return continuationBindingResult{
+		Kind:      continuationBindingCanonical,
+		AccountID: accountID,
+		Resolved:  &resolvedAccount{State: state, AccountID: accountID},
+	}
+}
+
+// writeSessionBindingError writes a typed 4xx/5xx response for a continuation
+// binding that can't be safely dispatched. Clients see a structured error
+// body with a `type` field they can key off to decide whether to retry,
+// restart the session, or wait and try again.
+func writeSessionBindingError(c *gin.Context, reqID string, binding continuationBindingResult) {
+	switch binding.Kind {
+	case continuationBindingAccountUnavailable:
+		log.Printf("[responses rid=%s] session binding unavailable: account=%s reason=%q", reqID, binding.AccountID, binding.Reason)
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": gin.H{
+				"type":       "session_bound_account_unavailable",
+				"message":    binding.Reason,
+				"account_id": binding.AccountID,
+			},
+		})
+	case continuationBindingSplit:
+		log.Printf("[responses rid=%s] session split history: accounts=%v reason=%q", reqID, binding.SplitAccounts, binding.Reason)
+		c.JSON(http.StatusConflict, gin.H{
+			"error": gin.H{
+				"type":     "session_split_history",
+				"message":  binding.Reason,
+				"accounts": binding.SplitAccounts,
+			},
+		})
+	default: // continuationBindingOrphan
+		log.Printf("[responses rid=%s] session expired: reason=%q", reqID, binding.Reason)
+		c.JSON(http.StatusGone, gin.H{
+			"error": gin.H{
+				"type":    "session_expired",
+				"message": binding.Reason,
+			},
+		})
+	}
+}
+
+// continuationDegradeOptIn reports whether the caller explicitly opted into
+// lossy orphan degrade for this request. The header surface is kept small
+// on purpose — one value for now; future modes would extend the enum rather
+// than proliferating headers. `sub2api` sets this when its cross-provider
+// switching path wants best-effort continuation; native clients do not.
+func continuationDegradeOptIn(c *gin.Context) bool {
+	return strings.EqualFold(strings.TrimSpace(c.GetHeader("X-Copilot-Continuation-Degrade")), "orphan")
+}
+
 func proxyResponses(c *gin.Context) {
 	isPool, _ := c.Get("isPool")
 	maxAttempts := 1
@@ -955,7 +1242,9 @@ func proxyResponses(c *gin.Context) {
 		maxAttempts = 3
 	}
 
+	bodyReadStart := time.Now()
 	bodyBytes, err := io.ReadAll(c.Request.Body)
+	bodyReadMs := time.Since(bodyReadStart).Milliseconds()
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read request body"})
 		return
@@ -970,6 +1259,17 @@ func proxyResponses(c *gin.Context) {
 	refreshedOnAccount := make(map[string]bool)
 	crossAccountRollover := false
 	orphanDegraded := false
+	// orphanTranslate: when true, the orphan branch below selected the
+	// in-process Responses→chat/completions translator route (gated by
+	// config.ResponsesOrphanTranslate() and the account having a WorkerURL).
+	// The invoke selection below picks DoOrphanTranslateResponsesProxy in
+	// that case so the orphan turn bypasses stateful /v1/responses upstream.
+	orphanTranslate := false
+	// orphanTranslateMessages: like orphanTranslate but routes to the
+	// Responses→/v1/messages translator (Anthropic-compat). Used for the
+	// gpt-5 family and Claude models, which Copilot's /v1/chat/completions
+	// rejects with "Please use /v1/responses or /v1/messages".
+	orphanTranslateMessages := false
 	// pinnedAccount, when non-nil, forces the next iteration to reuse the same account
 	// without consulting sticky caches or the pool. Used after a successful force-refresh
 	// so the refreshed token is actually exercised on the account that minted it, rather
@@ -997,9 +1297,156 @@ func proxyResponses(c *gin.Context) {
 	if len(functionCallOutputIDs) > 0 {
 		fcSticky, fcStickyOK = instance.LookupResponseFunctionCallAccount(functionCallOutputIDs)
 	}
-	log.Printf("[responses rid=%s] recv model=%q prev_id=%q fc_ids=%v pool=%v strategy=%q continuation=%v prev_sticky_replay=%q(%v) prev_sticky_turn=%q(%v) fc_sticky=%q(%v)",
+	log.Printf("[responses rid=%s] recv model=%q prev_id=%q fc_ids=%v pool=%v strategy=%q continuation=%v body_bytes=%d body_read_ms=%d prev_sticky_replay=%q(%v) prev_sticky_turn=%q(%v) fc_sticky=%q(%v)",
 		reqID, requestedModel, previousResponseID, functionCallOutputIDs, isPool == true, poolStrategy, continuationRequested,
+		len(bodyBytes), bodyReadMs,
 		prevStickyReplay, prevStickyReplayOK, prevStickyTurn, prevStickyTurnOK, fcSticky, fcStickyOK)
+
+	// Strict per-session binding for continuation requests.
+	//
+	// A continuation is any request that carries previous_response_id OR
+	// function_call_output ids from a prior turn. Upstream Copilot validates
+	// those ids against the specific account+interaction that minted them:
+	// if we dispatch to a different account than the one that owns the
+	// history, upstream returns `input item does not belong to this
+	// connection` and our degrade fallback text-ifies the entire tool loop —
+	// which is what caused codex's write_stdin death loop. So we classify the
+	// binding here, once, before the retry loop:
+	//   - Canonical (every hit agrees on one available account) → pin it for
+	//     every attempt. Cross-account rollover is disabled downstream by
+	//     forcing continuationCanDetach=false. 401 force-refresh still
+	//     retries the same account via pinnedAccount.
+	//   - AccountUnavailable (canonical account blocked/stopped) → 503. The
+	//     user must wait or restart; we won't silently rotate.
+	//   - Split (two or more accounts claim different call_ids) → 409. The
+	//     history is unrecoverable on any single account.
+	//   - Orphan (no hits) → 410, unless the caller set
+	//     X-Copilot-Continuation-Degrade: orphan, in which case we degrade
+	//     the fc history into text and fall through to first-turn routing.
+	var continuationPinned *resolvedAccount
+	// degradeOptIn is computed once and consulted in two places: the pre-loop
+	// orphan-from-cache branch (directly below) and the in-loop
+	// replay-invalid-from-upstream branch further down. Both must agree so
+	// that codex / pi clients (which never set the header) always see typed
+	// errors and sub2api (which sets it) keeps its best-effort degrade path.
+	degradeOptIn := continuationRequested && continuationDegradeOptIn(c)
+	if continuationRequested {
+		binding := resolveContinuationBinding(previousResponseID, functionCallOutputIDs, requestedModel)
+		log.Printf("[responses rid=%s] continuation_binding kind=%d account=%s split=%v hits=%d misses=%d reason=%q degrade_opt_in=%v",
+			reqID, binding.Kind, binding.AccountID, binding.SplitAccounts, binding.HitCount, binding.MissCount, binding.Reason, degradeOptIn)
+		switch binding.Kind {
+		case continuationBindingCanonical:
+			continuationPinned = binding.Resolved
+		case continuationBindingAccountUnavailable, continuationBindingSplit:
+			// Non-canonical but recoverable via orphan_translate flatten:
+			// Split = history spans multiple accounts (common after a client-
+			// side compact that exposes cross-account call_ids); Unavailable
+			// = sole owner account is blocked/stopped. Because the flatten
+			// path drops all tool_call_ids (history → prose), neither case
+			// depends on any specific account owning the ids — we can clear
+			// continuation state and re-dispatch to any worker-capable
+			// account in the pool. Falls back to the original typed error
+			// (409/503) when flatten isn't armable.
+			armed := ""
+			if config.OrphanPassthrough() != "off" &&
+				config.ResponsesOrphanTranslate() == "on" &&
+				len(functionCallOutputIDs) > 0 &&
+				canOrphanPassthrough(c, requestedModel, exclude) {
+				switch {
+				case orphanTranslateMessagesModel(requestedModel):
+					orphanTranslateMessages = true
+					armed = "messages"
+				case orphanTranslateCompatibleModel(requestedModel):
+					orphanTranslate = true
+					armed = "chat"
+				}
+			}
+			if armed != "" {
+				if isPool == true {
+					for _, id := range workerDisabledAccountIDs(requestedModel) {
+						exclude[id] = true
+					}
+				}
+				log.Printf("[responses rid=%s] binding_kind=%d recovery: armed orphan_translate route=%s hits=%d misses=%d fc_ids=%d accounts=%v reason=%q",
+					reqID, binding.Kind, armed, binding.HitCount, binding.MissCount, len(functionCallOutputIDs), binding.SplitAccounts, binding.Reason)
+				previousResponseID = ""
+				functionCallOutputIDs = nil
+				continuationRequested = false
+				break
+			}
+			writeSessionBindingError(c, reqID, binding)
+			return
+		case continuationBindingOrphan:
+			// Default-on non-lossy passthrough for cross-relay migration:
+			// when the orphan is a function_call_output orphan (input is
+			// self-contained, history is present in full), worker mode is
+			// available, and no degrade opt-in was requested, clear sticky
+			// state and route fresh. Worker translates to stateless chat/
+			// completions upstream so tool_call_ids don't need to match any
+			// server-side session record.
+			//
+			// Skipped for prev_response_id-only orphans because that case's
+			// input is truncated and depends on server-side history — we
+			// can't recover it without re-sending full history, so 410 is
+			// still the honest answer.
+			if !degradeOptIn && config.OrphanPassthrough() != "off" &&
+				len(functionCallOutputIDs) > 0 && canOrphanPassthrough(c, requestedModel, exclude) {
+				// Queue non-worker accounts into the exclude set so the
+				// pool-routing path below only picks worker-enabled ones.
+				// Direct-mode accounts would hit the Responses endpoint
+				// which IS session-stateful and would reject the orphan.
+				if isPool == true {
+					for _, id := range workerDisabledAccountIDs(requestedModel) {
+						exclude[id] = true
+					}
+				}
+				log.Printf("[responses rid=%s] orphan_passthrough pre-loop: hits=%d misses=%d fc_ids=%d — clearing continuation and routing via worker pool",
+					reqID, binding.HitCount, binding.MissCount, len(functionCallOutputIDs))
+				previousResponseID = ""
+				functionCallOutputIDs = nil
+				continuationRequested = false
+				// When orphan-translate mode is armed, the invoke selection
+				// below picks DoOrphanTranslateResponsesProxy so the fresh
+				// routing lands on the worker's stateless chat/completions
+				// instead of its stateful /v1/responses (which proxies to
+				// Copilot's session-validating /v1/responses and would 401
+				// on cross-relay fc_ids).
+				if config.ResponsesOrphanTranslate() == "on" {
+					switch {
+					case orphanTranslateCompatibleModel(requestedModel):
+						orphanTranslate = true
+						log.Printf("[responses rid=%s] orphan_translate armed for this request (chat-completions route, model=%q)", reqID, requestedModel)
+					case orphanTranslateMessagesModel(requestedModel):
+						orphanTranslateMessages = true
+						log.Printf("[responses rid=%s] orphan_translate armed for this request (messages route, model=%q)", reqID, requestedModel)
+					default:
+						log.Printf("[responses rid=%s] orphan_translate skipped for model=%q — no compatible route, falling through to orphan_passthrough", reqID, requestedModel)
+					}
+				}
+				// bodyBytes unchanged: input carries the full self-contained
+				// history including structured tool-use items.
+				break
+			}
+			if !degradeOptIn {
+				writeSessionBindingError(c, reqID, binding)
+				return
+			}
+			// Opt-in degrade: textify the fc items, clear continuation state,
+			// and fall through to the normal first-turn pool routing below.
+			degradedBody, changed, degErr := instance.DegradeOrphanContinuationPayload(bodyBytes)
+			if degErr != nil || changed == 0 {
+				log.Printf("[responses rid=%s] orphan degrade opt-in requested but could not apply (changed=%d err=%v); emitting 410", reqID, changed, degErr)
+				writeSessionBindingError(c, reqID, binding)
+				return
+			}
+			bodyBytes = degradedBody
+			orphanDegraded = true
+			previousResponseID = ""
+			functionCallOutputIDs = nil
+			continuationRequested = false
+			log.Printf("[responses rid=%s] orphan degrade opt-in applied pre-loop: degraded %d fc items to text", reqID, changed)
+		}
+	}
 
 	for attempt := 0; attempt < attemptLimit; attempt++ {
 		var resolved *resolvedAccount
@@ -1008,19 +1455,9 @@ func proxyResponses(c *gin.Context) {
 			resolved = pinnedAccount
 			stickyKind = "pinned_refresh_retry"
 			pinnedAccount = nil
-		} else if !crossAccountRollover {
-			switch {
-			case previousResponseID != "":
-				resolved = resolveStateForResponseReplay(c, previousResponseID, requestedModel)
-				if resolved != nil {
-					stickyKind = "prev_response_id"
-				}
-			case len(functionCallOutputIDs) > 0:
-				resolved = resolveStateForResponseFunctionCallReplay(functionCallOutputIDs, requestedModel)
-				if resolved != nil {
-					stickyKind = "function_call_output"
-				}
-			}
+		} else if continuationPinned != nil {
+			resolved = continuationPinned
+			stickyKind = "session_binding_canonical"
 		}
 		fellBackToPool := false
 		if resolved == nil {
@@ -1046,6 +1483,16 @@ func proxyResponses(c *gin.Context) {
 		instance.RecordRequest(resolved.AccountID, false, false)
 
 		continuationCanDetach := continuationRequested && instance.CanReplayResponsesContinuation(resolved.AccountID, previousResponseID)
+		// When the session is canonical-bound, disable the detach/rollover
+		// machinery outright: the one retry budget we care about is 401
+		// force-refresh on the same account (handled below via pinnedAccount),
+		// never cross-account. Leaving continuationCanDetach true here would
+		// let the retry branches below flip crossAccountRollover=true and
+		// route a future attempt to a different account, guaranteeing an
+		// orphan reject — which is exactly the bug this refactor closes.
+		if continuationPinned != nil {
+			continuationCanDetach = false
+		}
 		invoke := instance.DoResponsesProxy
 		modeName := "direct"
 		if continuationRequested {
@@ -1058,12 +1505,35 @@ func proxyResponses(c *gin.Context) {
 				modeName = "detached_same"
 			}
 		}
+		// orphan_translate overrides the mode selection: it only kicks in on
+		// the pre-loop orphan branch, which has already cleared continuation
+		// state, so the detached-continuation modes above don't apply.
+		// Needs a WorkerURL on the resolved account — fall back silently to
+		// direct mode if the pool surfaced a non-worker account.
+		if orphanTranslate {
+			if acct, _ := store.GetAccount(resolved.AccountID); acct != nil && strings.TrimSpace(acct.WorkerURL) != "" {
+				invoke = instance.DoOrphanTranslateResponsesProxy
+				modeName = "orphan_translate"
+			} else {
+				log.Printf("[responses rid=%s attempt=%d] orphan_translate armed but account=%s has no WorkerURL — direct", reqID, attempt, resolved.AccountID)
+			}
+		}
+		if orphanTranslateMessages {
+			if acct, _ := store.GetAccount(resolved.AccountID); acct != nil && strings.TrimSpace(acct.WorkerURL) != "" {
+				invoke = instance.DoOrphanTranslateMessagesProxy
+				modeName = "orphan_translate_messages"
+			} else {
+				log.Printf("[responses rid=%s attempt=%d] orphan_translate_messages armed but account=%s has no WorkerURL — direct", reqID, attempt, resolved.AccountID)
+			}
+		}
 		log.Printf("[responses rid=%s attempt=%d] mode=%s can_detach=%v account=%s",
 			reqID, attempt, modeName, continuationCanDetach, resolved.AccountID)
 
+		invokeStart := time.Now()
 		resp, forwardedBody, turnRequest, proxyErr := invoke(resolved.AccountID, resolved.State, bodyBytes)
-		log.Printf("[responses rid=%s attempt=%d] turn_ctx=%s interaction_type=%s",
-			reqID, attempt, turnRequest.CacheSource, turnRequest.InteractionType)
+		invokeMs := time.Since(invokeStart).Milliseconds()
+		log.Printf("[responses rid=%s attempt=%d] turn_ctx=%s interaction_type=%s invoke_ms=%d",
+			reqID, attempt, turnRequest.CacheSource, turnRequest.InteractionType, invokeMs)
 		if proxyErr != nil {
 			if resp != nil {
 				_ = resp.Body.Close()
@@ -1104,7 +1574,16 @@ func proxyResponses(c *gin.Context) {
 						reqID, attempt, resolved.AccountID, modeName, truncateForLog(detail, 240))
 					continue
 				}
-				if !orphanDegraded && attempt < attemptLimit-1 {
+				// The in-loop orphan-degrade branch text-ifies the tool
+				// history when upstream reports `input item does not belong to
+				// this connection`. It is the real driver of the codex
+				// write_stdin death loop: once degrade fires, the model sees
+				// a summarized history every subsequent turn and never
+				// regains tool-loop structure. Gate it on the same opt-in
+				// header the pre-loop orphan branch uses so native clients
+				// (codex, pi) get a typed 502 they can react to, and sub2api
+				// continues to get best-effort degrade when it asks.
+				if degradeOptIn && !orphanDegraded && attempt < attemptLimit-1 {
 					degradedBody, changed, degErr := instance.DegradeOrphanContinuationPayload(bodyBytes)
 					if degErr == nil && changed > 0 {
 						bodyBytes = degradedBody
@@ -1113,6 +1592,7 @@ func proxyResponses(c *gin.Context) {
 						previousResponseID = ""
 						functionCallOutputIDs = nil
 						continuationRequested = false
+						continuationPinned = nil
 						crossAccountRollover = false
 						log.Printf("[responses rid=%s attempt=%d] orphan continuation on account=%s mode=%s, degraded %d fc items to text, retrying fresh; detail=%q",
 							reqID, attempt, resolved.AccountID, modeName, changed, truncateForLog(detail, 240))
@@ -1122,9 +1602,48 @@ func proxyResponses(c *gin.Context) {
 					}
 					log.Printf("[responses rid=%s attempt=%d] orphan degrade skipped (changed=%d err=%v)", reqID, attempt, changed, degErr)
 				}
-				log.Printf("[responses rid=%s attempt=%d] replay-invalid on account=%s mode=%s, emitting 502 (can_detach=%v attempt_budget_left=%v is_pool=%v orphan_degraded=%v); detail=%q",
-					reqID, attempt, resolved.AccountID, modeName, continuationCanDetach, attempt < attemptLimit-1, isPool == true, orphanDegraded, truncateForLog(detail, 240))
-				c.JSON(http.StatusBadGateway, gin.H{"error": "response continuation recovery failed"})
+				// Canonical binding said "this account owns the history" but
+				// upstream disagreed (session state was evicted / rotated).
+				// Treat this as a late orphan and fall through to the orphan
+				// translate path, which flattens tool history and dispatches
+				// to the worker's stateless endpoint. Unlike the opt-in
+				// degrade above, this does NOT require the degrade header —
+				// the translator is the canonical flatten-and-retry mechanism
+				// and already runs on orphan-bound traffic today. Guarded by
+				// orphanDegraded so a single request degrades at most once.
+				if !orphanDegraded && attempt < attemptLimit-1 && config.ResponsesOrphanTranslate() == "on" {
+					acct, _ := store.GetAccount(resolved.AccountID)
+					hasWorker := acct != nil && strings.TrimSpace(acct.WorkerURL) != ""
+					if hasWorker {
+						armed := ""
+						switch {
+						case orphanTranslateMessagesModel(requestedModel):
+							orphanTranslateMessages = true
+							armed = "messages"
+						case orphanTranslateCompatibleModel(requestedModel):
+							orphanTranslate = true
+							armed = "chat"
+						}
+						if armed != "" {
+							orphanDegraded = true
+							exclude[resolved.AccountID] = true
+							previousResponseID = ""
+							functionCallOutputIDs = nil
+							continuationRequested = false
+							continuationPinned = nil
+							crossAccountRollover = false
+							log.Printf("[responses rid=%s attempt=%d] replay-invalid on account=%s mode=%s, re-dispatching via orphan_translate route=%s; detail=%q",
+								reqID, attempt, resolved.AccountID, modeName, armed, truncateForLog(detail, 240))
+							continue
+						}
+					}
+				}
+				log.Printf("[responses rid=%s attempt=%d] replay-invalid on account=%s mode=%s, emitting 502 (can_detach=%v attempt_budget_left=%v is_pool=%v orphan_degraded=%v degrade_opt_in=%v); detail=%q",
+					reqID, attempt, resolved.AccountID, modeName, continuationCanDetach, attempt < attemptLimit-1, isPool == true, orphanDegraded, degradeOptIn, truncateForLog(detail, 240))
+				c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{
+					"type":    "session_upstream_orphan",
+					"message": "upstream rejected the continuation: the tool-call history cannot be replayed on the bound account. Restart the conversation.",
+				}})
 				return
 			}
 		}
@@ -1201,8 +1720,8 @@ func proxyResponses(c *gin.Context) {
 			log.Printf("[responses rid=%s attempt=%d] post-degrade %d body on account=%s (final): %q",
 				reqID, attempt, resp.StatusCode, resolved.AccountID, peekAndRestoreBody(resp, 400))
 		}
-		log.Printf("[responses rid=%s attempt=%d] forwarding upstream_status=%d account=%s mode=%s",
-			reqID, attempt, resp.StatusCode, resolved.AccountID, modeName)
+		log.Printf("[responses rid=%s attempt=%d] forwarding upstream_status=%d account=%s mode=%s invoke_ms=%d",
+			reqID, attempt, resp.StatusCode, resolved.AccountID, modeName, invokeMs)
 		c.Set("respReqID", reqID)
 		instance.ForwardResponsesResponse(c, resolved.AccountID, turnRequest, forwardedBody, resp)
 		return

@@ -3,6 +3,7 @@ package instance
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log"
@@ -39,6 +40,21 @@ func DoDetachedResponsesProxyCrossAccount(accountID string, state *config.State,
 
 func doResponsesProxy(accountID string, state *config.State, bodyBytes []byte, mode responsesProxyMode) (*http.Response, []byte, copilotTurnRequest, error) {
 	turnRequest := newCopilotTurnRequest(copilotInteractionTypeUser)
+
+	// Resolve per-account worker routing. When an account has WorkerURL set and
+	// USE_WORKER_POOL is not forced off, requests go through caozhiyuan/copilot-api
+	// running as a loopback sidecar. The worker ONLY does format translation
+	// (OpenAI Responses-API ↔ Copilot chat). Session state — previous_response_id
+	// expansion, compaction rewrite, call_id canonicalization, sticky-cache
+	// lookups — stays in the Go router and runs unconditionally. Skipping those
+	// in worker mode breaks continuation / cross-relay migration / orphan detection.
+	var workerURL string
+	if config.WorkerPoolMode() != "off" {
+		if acct, _ := store.GetAccount(accountID); acct != nil {
+			workerURL = strings.TrimSpace(acct.WorkerURL)
+		}
+	}
+	useWorker := workerURL != ""
 
 	// Convert model ID and normalize token limit fields for providers that reject max_tokens.
 	var payload map[string]interface{}
@@ -92,6 +108,18 @@ func doResponsesProxy(accountID string, state *config.State, bodyBytes []byte, m
 		bodyBytes, _ = json.Marshal(payload)
 	}
 
+	if useWorker {
+		start := time.Now()
+		resp, err := ProxyRequestViaWorker(context.Background(), workerURL, "POST", "/v1/responses", bodyBytes, nil)
+		statusCode := 0
+		if resp != nil {
+			statusCode = resp.StatusCode
+		}
+		log.Printf("[responses account=%s] worker=%s worker_ms=%d status=%d err=%v",
+			accountID, workerURL, time.Since(start).Milliseconds(), statusCode, err)
+		return resp, bodyBytes, turnRequest, err
+	}
+
 	resp, err := ProxyRequestWithBytes(state, "POST", "/responses", bodyBytes, turnRequest.Headers(), false)
 	return resp, bodyBytes, turnRequest, err
 }
@@ -102,7 +130,17 @@ func usesResponsesMaxCompletionTokens(modelID string) bool {
 
 // ForwardResponsesResponse forwards the upstream response directly to client.
 func ForwardResponsesResponse(c *gin.Context, accountID string, turnRequest copilotTurnRequest, requestBody []byte, resp *http.Response) {
-	defer func() { _ = resp.Body.Close() }()
+	reqID := ""
+	if v, ok := c.Get("respReqID"); ok {
+		if s, _ := v.(string); s != "" {
+			reqID = s
+		}
+	}
+	defer func() {
+		closeStart := time.Now()
+		_ = resp.Body.Close()
+		log.Printf("[responses rid=%s] post_close_ms=%d (resp.Body.Close)", reqID, time.Since(closeStart).Milliseconds())
+	}()
 
 	contentType := resp.Header.Get("Content-Type")
 	isStream := strings.Contains(contentType, "text/event-stream")
@@ -140,10 +178,28 @@ func forwardResponsesStream(c *gin.Context, accountID string, turnRequest copilo
 	startedAt := time.Now()
 	writeErrOccurred := false
 	var exitErr error
+	// Track call_ids we've already stashed in the in-memory sticky cache so we
+	// don't re-write them on every SSE line. Bind each new call_id to the
+	// current account + turn context *as soon as we see the corresponding
+	// function_call item* rather than waiting for stream terminal. If upstream
+	// drops mid-stream, the ids we've already forwarded to the client stay in
+	// the sticky cache — the next turn's canonical binding still resolves
+	// instead of orphaning on an account we never stored.
+	stashedFCIDs := map[string]bool{}
+	stashNewFCIDs := func() {
+		for _, id := range collectResponsesFunctionCallIDs(capture.ReplayItems) {
+			if stashedFCIDs[id] {
+				continue
+			}
+			stashedFCIDs[id] = true
+			stashResponseFunctionCallTurnContextInMemory(accountID, []string{id}, turnRequest.Context)
+		}
+	}
 	c.Stream(func(w io.Writer) bool {
 		line, err := reader.ReadBytes(0x0A)
 		if len(line) > 0 {
 			capture.absorbLine(line)
+			stashNewFCIDs()
 			probe.observe(line)
 			if _, writeErr := w.Write(line); writeErr != nil {
 				writeErrOccurred = true
@@ -174,9 +230,20 @@ func forwardResponsesStream(c *gin.Context, accountID string, turnRequest copilo
 		return true
 	})
 	probe.log("responses", reqID, accountID, time.Since(startedAt), exitErr, writeErrOccurred)
+	postStreamStart := time.Now()
+	t0 := postStreamStart
 	storeResponsesReplayFromStream(accountID, requestBody, capture)
+	t1 := time.Now()
 	storeResponseTurnContext(accountID, capture.ResponseID, turnRequest.Context)
+	t2 := time.Now()
 	storeResponseFunctionCallTurnContext(accountID, collectResponsesFunctionCallIDs(capture.ReplayItems), turnRequest.Context)
+	t3 := time.Now()
+	log.Printf("[responses rid=%s] post_stream store_replay_ms=%d store_turn_ms=%d store_fc_turn_ms=%d total_post_ms=%d",
+		reqID,
+		t1.Sub(t0).Milliseconds(),
+		t2.Sub(t1).Milliseconds(),
+		t3.Sub(t2).Milliseconds(),
+		t3.Sub(postStreamStart).Milliseconds())
 }
 
 // streamTailProbe records basic stats and the last few SSE lines written to the client.

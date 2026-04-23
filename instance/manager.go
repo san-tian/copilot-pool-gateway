@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -379,6 +380,89 @@ func GetDefaultHTTPClient() *http.Client {
 
 func ProxyRequestWithBytes(state *config.State, method, path string, bodyBytes []byte, extraHeaders http.Header, hasVision bool) (*http.Response, error) {
 	return ProxyRequestWithBytesCtx(context.Background(), state, method, path, bodyBytes, extraHeaders, hasVision)
+}
+
+var (
+	workerClientOnce sync.Once
+	workerHTTPClient *http.Client
+)
+
+// getWorkerClient returns a shared HTTP client for per-account sidecar workers on loopback.
+// Connect timeout is 2s — if the worker unit is down or the port is wrong, fail fast so the
+// retry loop can hop to the next account. No overall request timeout: SSE streams last as
+// long as the upstream stream does.
+func getWorkerClient() *http.Client {
+	workerClientOnce.Do(func() {
+		t := &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   2 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+			MaxIdleConns:          100,
+			MaxIdleConnsPerHost:   20,
+			ResponseHeaderTimeout: 2 * time.Minute,
+		}
+		workerHTTPClient = &http.Client{Transport: t}
+	})
+	return workerHTTPClient
+}
+
+// copilotHeaderBlocklist lists request headers that must NOT be forwarded to a worker,
+// because the worker re-derives them from its own Copilot session. Keys are lowercased.
+var copilotHeaderBlocklist = map[string]struct{}{
+	"authorization":                       {},
+	"editor-version":                      {},
+	"editor-plugin-version":               {},
+	"openai-intent":                       {},
+	"x-initiator":                         {},
+	"x-request-id":                        {},
+	"x-github-api-version":                {},
+	"x-vscode-user-agent-library-version": {},
+	"host":                                {},
+	"content-length":                      {},
+	"connection":                          {},
+	"transfer-encoding":                   {},
+}
+
+// copyNonCopilotHeaders forwards client headers to dst, stripping anything Copilot-specific
+// (the worker re-applies its own). Catches both the explicit blocklist and any Copilot-*
+// prefix.
+func copyNonCopilotHeaders(dst, src http.Header) {
+	for k, vs := range src {
+		lk := strings.ToLower(k)
+		if _, blocked := copilotHeaderBlocklist[lk]; blocked {
+			continue
+		}
+		if strings.HasPrefix(lk, "copilot-") {
+			continue
+		}
+		for _, v := range vs {
+			dst.Add(k, v)
+		}
+	}
+}
+
+// ProxyRequestViaWorker forwards a request to a per-account sidecar worker (caozhiyuan/copilot-api)
+// bound to loopback. The worker owns payload translation (compact, tool rewrites, stream-id
+// sync, web-search filter) and re-establishes its own Copilot session, so we pass bodyBytes
+// through untouched and strip Copilot-specific request headers before forwarding.
+func ProxyRequestViaWorker(ctx context.Context, workerURL, method, path string, bodyBytes []byte, clientHeaders http.Header) (*http.Response, error) {
+	target := strings.TrimRight(workerURL, "/") + path
+	req, err := http.NewRequestWithContext(ctx, method, target, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, err
+	}
+	copyNonCopilotHeaders(req.Header, clientHeaders)
+	if req.Header.Get("Content-Type") == "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if req.Header.Get("Accept") == "" {
+		req.Header.Set("Accept", "text/event-stream, application/json")
+	}
+	return getWorkerClient().Do(req)
 }
 
 func ProxyRequestWithBytesCtx(ctx context.Context, state *config.State, method, path string, bodyBytes []byte, extraHeaders http.Header, hasVision bool) (*http.Response, error) {

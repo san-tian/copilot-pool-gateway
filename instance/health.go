@@ -37,6 +37,12 @@ func DisableAccount(accountID, reason string) error {
 		SetAccountError(*account, reason)
 	}
 
+	// Clear every sticky-cache entry pointing at this account so future
+	// continuation requests classify as SessionOrphan cleanly instead of
+	// SessionCanonical-but-unavailable (which surfaces as a user-visible 503
+	// the client can do nothing about while the account sits disabled).
+	EvictAccountContinuationCaches(accountID)
+
 	name := accountID
 	if account != nil && account.Name != "" {
 		name = account.Name

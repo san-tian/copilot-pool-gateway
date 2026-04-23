@@ -896,22 +896,40 @@ function Dashboard() {
   )
 }
 
+declare global {
+  interface Window {
+    __CC_VIEW__?: string
+  }
+}
+
+function getInjectedView(): string {
+  return typeof window !== "undefined" && typeof window.__CC_VIEW__ === "string"
+    ? window.__CC_VIEW__
+    : ""
+}
+
 function getPublicReauthId(): string | null {
   const match = window.location.pathname.match(/^\/reauth\/([^/]+)$/)
   return match ? decodeURIComponent(match[1]) : null
 }
 
 function isPublicSupplierAuthPath(): boolean {
-  return window.location.pathname === "/supplier-auth"
+  return window.location.pathname === "/supplier-auth" || getInjectedView() === "supplier-auth"
+}
+
+function isPublicLoginPath(): boolean {
+  return getInjectedView() === "login"
 }
 
 export function App() {
   const publicReauthId = getPublicReauthId()
   const isPublicSupplierAuth = isPublicSupplierAuthPath()
+  const forceLogin = isPublicLoginPath()
   const [authState, setAuthState] = useState<AuthState>("loading")
   const t = useT()
 
   useEffect(() => {
+    if (forceLogin) { setAuthState("login"); return }
     void (async () => {
       try {
         const config = await api.getConfig()
@@ -923,7 +941,7 @@ export function App() {
         setAuthState("login")
       } catch { setAuthState("login") }
     })()
-  }, [])
+  }, [forceLogin])
 
   if (publicReauthId) return <PublicReauthPage sessionId={publicReauthId} />
   if (isPublicSupplierAuth) return <PublicSupplierAuthPage />

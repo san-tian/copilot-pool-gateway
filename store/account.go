@@ -27,6 +27,7 @@ type Account struct {
 	ProbeStatus       string   `json:"probeStatus,omitempty"`
 	ProbeCheckedAt    string   `json:"probeCheckedAt,omitempty"`
 	ProbeError        string   `json:"probeError,omitempty"`
+	WorkerURL         string   `json:"workerUrl,omitempty"`
 }
 
 type PoolConfig struct {
@@ -342,6 +343,9 @@ func UpdateAccount(id string, updates map[string]interface{}) (*Account, error) 
 			}
 			if v, ok := updates["probeError"].(string); ok {
 				accounts[i].ProbeError = v
+			}
+			if v, ok := updates["workerUrl"].(string); ok {
+				accounts[i].WorkerURL = strings.TrimSpace(v)
 			}
 			if v, ok := updates["blockedModels"]; ok {
 				accounts[i].BlockedModels = stringSliceFromValue(v)

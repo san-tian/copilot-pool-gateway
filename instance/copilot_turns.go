@@ -305,6 +305,142 @@ func LookupResponseFunctionCallAccount(callIDs []string) (string, bool) {
 	return "", false
 }
 
+// SessionResolutionKind classifies how a set of function_call_output call_ids
+// maps onto the sticky cache. The three outcomes drive routing for
+// continuation requests on /v1/responses — see ResolveResponseFunctionCallSession.
+type SessionResolutionKind int
+
+const (
+	// SessionCanonical — every hit in the cache agrees on a single account.
+	// Partial misses (TTL-expired entries) are OK and counted in MissCount.
+	SessionCanonical SessionResolutionKind = iota
+	// SessionSplit — two or more accounts each own a subset of the call_ids.
+	// The history is cross-account contaminated and cannot be safely continued
+	// on any single account; upstream will orphan-reject no matter which we
+	// pick.
+	SessionSplit
+	// SessionOrphan — no call_id hits the cache. Either the session is new
+	// (first turn, fc_ids empty) or every entry expired out of the cache
+	// (30min TTL / 1024 LRU) or was evicted when its account was removed.
+	SessionOrphan
+)
+
+// SessionResolution is the result of classifying a set of function_call_output
+// call_ids against the sticky cache.
+type SessionResolution struct {
+	Kind          SessionResolutionKind
+	AccountID     string   // set when Kind == SessionCanonical
+	SplitAccounts []string // set when Kind == SessionSplit (sorted for stable diagnostics)
+	HitCount      int      // number of call_ids that hit the cache
+	MissCount     int      // number of call_ids that missed
+}
+
+// ResolveResponseFunctionCallSession classifies the supplied function_call_output
+// call_ids against the sticky cache. Intended as the single decision point for
+// continuation routing on /v1/responses: the caller dispatches on Kind instead
+// of using "any-match" LookupResponseFunctionCallAccount which silently picks
+// one account from a split history.
+func ResolveResponseFunctionCallSession(callIDs []string) SessionResolution {
+	ensureDurableContinuationStateLoaded()
+	trimmed := uniqueTrimmed(callIDs)
+	if len(trimmed) == 0 {
+		return SessionResolution{Kind: SessionOrphan}
+	}
+	accountSeen := make(map[string]bool)
+	hits := 0
+	for _, id := range trimmed {
+		if accountID, ok := lookupCopilotTurnCacheAccount(&responseFunctionCallTurnCache.mu, responseFunctionCallTurnCache.entries, id); ok {
+			accountSeen[accountID] = true
+			hits++
+		}
+	}
+	miss := len(trimmed) - hits
+	switch len(accountSeen) {
+	case 0:
+		return SessionResolution{Kind: SessionOrphan, HitCount: 0, MissCount: miss}
+	case 1:
+		var accountID string
+		for id := range accountSeen {
+			accountID = id
+		}
+		return SessionResolution{Kind: SessionCanonical, AccountID: accountID, HitCount: hits, MissCount: miss}
+	default:
+		accounts := make([]string, 0, len(accountSeen))
+		for id := range accountSeen {
+			accounts = append(accounts, id)
+		}
+		sort.Strings(accounts)
+		return SessionResolution{Kind: SessionSplit, SplitAccounts: accounts, HitCount: hits, MissCount: miss}
+	}
+}
+
+// stashResponseFunctionCallTurnContextInMemory writes an account-bound context
+// for a set of call_ids into the in-memory function-call cache without
+// triggering the gzip-and-rename durable persist. Used by the stream-capture
+// path to record call_ids incrementally on each function_call item so that if
+// the upstream connection drops mid-stream the already-seen ids are still
+// bound to the account that minted them. Caller is responsible for a single
+// persistDurableContinuationState() call at stream terminal or termination.
+func stashResponseFunctionCallTurnContextInMemory(accountID string, callIDs []string, ctx copilotTurnContext) {
+	callIDs = uniqueTrimmed(callIDs)
+	if len(callIDs) == 0 {
+		return
+	}
+	ensureDurableContinuationStateLoaded()
+	for _, callID := range callIDs {
+		storeCopilotTurnCacheEntry(&responseFunctionCallTurnCache.mu, responseFunctionCallTurnCache.entries, callID, accountID, ctx)
+	}
+}
+
+// EvictAccountContinuationCaches removes every sticky-cache entry bound to
+// the given accountID across the response-turn, function-call-turn,
+// message-tool-call-turn, and responses-replay caches, then persists the
+// updated snapshot. Called when an account transitions to disabled / deleted
+// / blocked-for-all-models so future continuation requests classify as
+// SessionOrphan cleanly instead of SessionCanonical-but-unavailable with a
+// 503 the user can do nothing about.
+func EvictAccountContinuationCaches(accountID string) {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return
+	}
+	ensureDurableContinuationStateLoaded()
+	evicted := 0
+	evicted += evictCopilotTurnCacheForAccountLocked(&responseTurnCache.mu, responseTurnCache.entries, accountID)
+	evicted += evictCopilotTurnCacheForAccountLocked(&responseFunctionCallTurnCache.mu, responseFunctionCallTurnCache.entries, accountID)
+	evicted += evictCopilotTurnCacheForAccountLocked(&messageToolCallTurnCache.mu, messageToolCallTurnCache.entries, accountID)
+	evicted += evictResponsesReplayForAccountLocked(accountID)
+	if evicted > 0 {
+		persistDurableContinuationState()
+	}
+}
+
+func evictCopilotTurnCacheForAccountLocked(mu *sync.Mutex, entries map[string]*copilotTurnCacheEntry, accountID string) int {
+	mu.Lock()
+	defer mu.Unlock()
+	removed := 0
+	for key, entry := range entries {
+		if entry.AccountID == accountID {
+			delete(entries, key)
+			removed++
+		}
+	}
+	return removed
+}
+
+func evictResponsesReplayForAccountLocked(accountID string) int {
+	responsesReplayCache.mu.Lock()
+	defer responsesReplayCache.mu.Unlock()
+	removed := 0
+	for key, entry := range responsesReplayCache.entries {
+		if entry.AccountID == accountID {
+			delete(responsesReplayCache.entries, key)
+			removed++
+		}
+	}
+	return removed
+}
+
 func storeCopilotTurnCacheEntry(mu *sync.Mutex, entries map[string]*copilotTurnCacheEntry, key string, accountID string, ctx copilotTurnContext) {
 	key = strings.TrimSpace(key)
 	accountID = strings.TrimSpace(accountID)

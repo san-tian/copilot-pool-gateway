@@ -21,6 +21,17 @@ var continuationStateLoadOnce sync.Once
 var continuationStateWriteMu sync.Mutex
 var durableContinuationPersistenceDisabled bool
 
+// Async debounced persister. Writing the full state snapshot is an O(cache-size)
+// operation (observed 130MB JSON + gzip on a busy node) and was previously
+// triggered synchronously on every store* mutation while holding the call path
+// that pi-client waits on to see the TCP FIN. Signal coalescing collapses a
+// burst of store* calls into at most one on-disk write per debounce window.
+var (
+	persistWakeCh        = make(chan struct{}, 1)
+	persistLoopStartOnce sync.Once
+	persistDebounce      = 200 * time.Millisecond
+)
+
 type durableCopilotTurnCacheEntry struct {
 	AccountID  string             `json:"account_id"`
 	Context    copilotTurnContext `json:"context"`
@@ -193,7 +204,48 @@ func restoreResponsesReplayEntries(snapshot map[string]durableResponsesReplayEnt
 	pruneResponsesReplayLocked(now)
 }
 
+// persistDurableContinuationState schedules a background write of the current
+// state. It returns immediately; the actual gzip+rename happens on a debounced
+// background goroutine so a burst of store* mutations coalesces into one write.
+// Tests that need the write to be visible on disk before reading must call
+// flushDurableContinuationStateForTests.
 func persistDurableContinuationState() {
+	if durableContinuationPersistenceDisabled {
+		return
+	}
+	ensureDurableContinuationStateLoaded()
+	ensureDurableContinuationPersistLoop()
+	select {
+	case persistWakeCh <- struct{}{}:
+	default:
+		// Already queued — coalesce.
+	}
+}
+
+func ensureDurableContinuationPersistLoop() {
+	persistLoopStartOnce.Do(func() {
+		go durableContinuationPersistLoop()
+	})
+}
+
+func durableContinuationPersistLoop() {
+	for range persistWakeCh {
+		// Debounce window: let further signals land in the buffer while we sleep.
+		time.Sleep(persistDebounce)
+		// Drain any coalesced signal that piled up during the sleep.
+		select {
+		case <-persistWakeCh:
+		default:
+		}
+		persistDurableContinuationStateNow()
+	}
+}
+
+// persistDurableContinuationStateNow does the synchronous snapshot + gzip +
+// atomic-rename write. Called from the background persist loop and from the
+// test flush helper. Safe to call directly in shutdown / eviction paths that
+// need the write to have completed by the time the call returns.
+func persistDurableContinuationStateNow() {
 	if durableContinuationPersistenceDisabled {
 		return
 	}
@@ -225,6 +277,13 @@ func persistDurableContinuationState() {
 		return
 	}
 	_ = os.Remove(legacyContinuationStateFile())
+}
+
+// flushDurableContinuationStateForTests synchronously writes any pending state
+// to disk. Tests that invoke store* mutators and then inspect the on-disk file
+// must call this first to avoid racing the background persist loop.
+func flushDurableContinuationStateForTests() {
+	persistDurableContinuationStateNow()
 }
 
 func writeGzipFile(path string, body []byte) error {
