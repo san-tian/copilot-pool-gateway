@@ -42,8 +42,6 @@ func TestResponsesToMessages_InstructionsBecomeTopLevelSystem(t *testing.T) {
 }
 
 func TestResponsesToMessages_SystemRoleFoldsIntoUser(t *testing.T) {
-	// Anthropic has no per-turn system role — items with role=system should
-	// be folded into user turns so their content isn't lost.
 	body := map[string]interface{}{
 		"model": "gpt-5",
 		"input": []interface{}{
@@ -53,16 +51,16 @@ func TestResponsesToMessages_SystemRoleFoldsIntoUser(t *testing.T) {
 	}
 	msg, _ := mustTranslateMessages(t, body)
 	msgs := msg["messages"].([]interface{})
-	if len(msgs) != 2 {
-		t.Fatalf("want 2 messages, got %d: %+v", len(msgs), msgs)
+	if len(msgs) != 1 {
+		t.Fatalf("want latest user message only, got %d: %+v", len(msgs), msgs)
 	}
 	first := msgs[0].(map[string]interface{})
-	if first["role"] != "user" || first["content"] != "extra guidance" {
-		t.Fatalf("system folded to user wrong: %+v", first)
+	if first["role"] != "user" || first["content"] != "hi" {
+		t.Fatalf("should restart from real user message, got %+v", first)
 	}
 }
 
-func TestResponsesToMessages_FunctionCallFlattenedAfterRealAssistant(t *testing.T) {
+func TestResponsesToMessages_ToolHistoryDroppedAfterRealAssistant(t *testing.T) {
 	body := map[string]interface{}{
 		"model": "gpt-5",
 		"input": []interface{}{
@@ -74,39 +72,20 @@ func TestResponsesToMessages_FunctionCallFlattenedAfterRealAssistant(t *testing.
 	}
 	msg, _ := mustTranslateMessages(t, body)
 	msgs := msg["messages"].([]interface{})
-	if len(msgs) != 4 {
-		t.Fatalf("want 4 messages, got %d: %+v", len(msgs), msgs)
+	if len(msgs) != 1 {
+		t.Fatalf("want latest user message only, got %d: %+v", len(msgs), msgs)
 	}
 
-	realAsst := msgs[1].(map[string]interface{})
-	if realAsst["role"] != "assistant" || realAsst["content"] != "Sure." {
-		t.Fatalf("real assistant should pass through verbatim, got %+v", realAsst)
+	user := msgs[0].(map[string]interface{})
+	if user["role"] != "user" || user["content"] != "list files" {
+		t.Fatalf("should restart from real user message, got %+v", user)
 	}
-
-	synAsst := msgs[2].(map[string]interface{})
-	if synAsst["role"] != "assistant" || synAsst["content"] != `[Tool call: Read({"p":"a"})]` {
-		t.Fatalf("synthetic assistant wrong: %+v", synAsst)
-	}
-	for _, k := range []string{"tool_use", "tool_calls"} {
-		if _, leaked := synAsst[k]; leaked {
-			t.Fatalf("flattened path must not emit %s, got %+v", k, synAsst)
-		}
-	}
-
-	toolUser := msgs[3].(map[string]interface{})
-	if toolUser["role"] != "user" {
-		t.Fatalf("tail should be user (tool-result + continue), got %+v", toolUser)
-	}
-	tc := toolUser["content"].(string)
-	if !strings.Contains(tc, "[Tool `Read` returned: content]") {
-		t.Fatalf("tool-result marker missing: %q", tc)
-	}
-	if !strings.HasSuffix(tc, "continue") {
-		t.Fatalf("trailing function_call_output should trigger continue, got: %q", tc)
+	if strings.Contains(user["content"].(string), "Tool call") || strings.Contains(user["content"].(string), "returned") {
+		t.Fatalf("tool history must not leak into user content: %q", user["content"])
 	}
 }
 
-func TestResponsesToMessages_MultipleFunctionCallsStackIntoOneAssistantTurn(t *testing.T) {
+func TestResponsesToMessages_MultipleFunctionCallsDropped(t *testing.T) {
 	body := map[string]interface{}{
 		"model": "gpt-5",
 		"input": []interface{}{
@@ -119,28 +98,16 @@ func TestResponsesToMessages_MultipleFunctionCallsStackIntoOneAssistantTurn(t *t
 	}
 	msg, _ := mustTranslateMessages(t, body)
 	msgs := msg["messages"].([]interface{})
-	if len(msgs) != 3 {
-		t.Fatalf("want 3 messages, got %d: %+v", len(msgs), msgs)
+	if len(msgs) != 1 {
+		t.Fatalf("want latest user message only, got %d: %+v", len(msgs), msgs)
 	}
-	synAsst := msgs[1].(map[string]interface{})
-	if synAsst["role"] != "assistant" {
-		t.Fatalf("want merged synthetic assistant at idx 1, got %+v", synAsst)
-	}
-	sc := synAsst["content"].(string)
-	if !strings.Contains(sc, "[Tool call: A({})]") || !strings.Contains(sc, "[Tool call: B({})]") {
-		t.Fatalf("adjacent tool_calls should merge: %q", sc)
-	}
-	tail := msgs[2].(map[string]interface{})
-	tc := tail["content"].(string)
-	if !strings.Contains(tc, "[Tool `A` returned: a]") || !strings.Contains(tc, "[Tool `B` returned: b]") {
-		t.Fatalf("adjacent tool_results should merge: %q", tc)
-	}
-	if !strings.HasSuffix(tc, "continue") {
-		t.Fatalf("tail should end with continue: %q", tc)
+	user := msgs[0].(map[string]interface{})
+	if user["role"] != "user" || user["content"] != "do two things" {
+		t.Fatalf("should restart from real user message, got %+v", user)
 	}
 }
 
-func TestResponsesToMessages_TailFunctionCallOutputSynthesizesContinue(t *testing.T) {
+func TestResponsesToMessages_TailFunctionCallOutputDroppedWhenUserExists(t *testing.T) {
 	body := map[string]interface{}{
 		"model": "gpt-5",
 		"input": []interface{}{
@@ -156,11 +123,8 @@ func TestResponsesToMessages_TailFunctionCallOutputSynthesizesContinue(t *testin
 		t.Fatalf("tail must be user, got %+v", tail)
 	}
 	content := tail["content"].(string)
-	if !strings.HasSuffix(content, "continue") {
-		t.Fatalf("continue suffix missing, got %q", content)
-	}
-	if !strings.Contains(content, "[Tool `N` returned: done]") {
-		t.Fatalf("continue should merge into the existing tool-result turn: %q", content)
+	if content != "x" {
+		t.Fatalf("should restart from latest user and drop tool output, got %q", content)
 	}
 }
 
@@ -192,12 +156,12 @@ func TestResponsesToMessages_DanglingFunctionCallAppendsUserTurn(t *testing.T) {
 	}
 	msg, _ := mustTranslateMessages(t, body)
 	msgs := msg["messages"].([]interface{})
-	if len(msgs) != 3 {
-		t.Fatalf("want 3 messages (user, synth assistant, continue user), got %d: %+v", len(msgs), msgs)
+	if len(msgs) != 1 {
+		t.Fatalf("want latest user message only, got %d: %+v", len(msgs), msgs)
 	}
-	tail := msgs[2].(map[string]interface{})
-	if tail["role"] != "user" || tail["content"] != "continue" {
-		t.Fatalf("tail should be fresh user 'continue', got %+v", tail)
+	tail := msgs[0].(map[string]interface{})
+	if tail["role"] != "user" || tail["content"] != "x" {
+		t.Fatalf("tail should be original user turn, got %+v", tail)
 	}
 }
 
@@ -367,7 +331,10 @@ func TestResponsesToMessages_FunctionCallOutputNonString(t *testing.T) {
 	msgs := msg["messages"].([]interface{})
 	tail := msgs[len(msgs)-1].(map[string]interface{})
 	content := tail["content"].(string)
-	if !strings.Contains(content, `"result"`) || !strings.Contains(content, `"ok"`) {
-		t.Fatalf("non-string output should JSON-stringify into content: %q", content)
+	if content != "x" {
+		t.Fatalf("tool output must be dropped, got: %q", content)
+	}
+	if strings.Contains(content, `"result"`) || strings.Contains(content, "Tool") {
+		t.Fatalf("tool output leaked into user content: %q", content)
 	}
 }

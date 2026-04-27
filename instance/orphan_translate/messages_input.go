@@ -11,7 +11,9 @@ import (
 //
 // Rationale: Copilot's /v1/chat/completions endpoint rejects the gpt-5 family
 // and Anthropic models with
-//   {"error":{"message":"Please use `/v1/responses` or `/v1/messages` API"}}
+//
+//	{"error":{"message":"Please use `/v1/responses` or `/v1/messages` API"}}
+//
 // The /v1/messages endpoint, however, is stateless (no session-bound
 // tool_use_ids) and accepts BOTH gpt-5.4 and claude-* via the Anthropic shape.
 // Routing gpt-5.4 orphan traffic through /v1/messages therefore lets us keep
@@ -22,14 +24,13 @@ import (
 // and Anthropic has no equivalent inline reasoning carrier.
 // Non-function tools (web_search, image_generation, custom types) are dropped.
 //
-// Prior tool history is FLATTENED into conversation prose (same rule as the
-// chat route): function_call → "[Tool call: name(args)]" text inside an
-// assistant turn; function_call_output → "[Tool `name` returned: output]"
-// text inside a user turn. The current-turn `tools` array still passes
-// through so the model can issue fresh tool calls (which messages_output.go
-// then re-wraps as Responses function_call events on the way back).
-// When the input tail is a function_call_output, synthesize a trailing
-// user "continue" signal so the agent loop continues transparently.
+// Prior reasoning and tool history is dropped instead of flattened into
+// ordinary prose. If the original Responses structure cannot be replayed on
+// the bound connection, prose markers such as "[Tool call: ...]" pollute the
+// next model turn and can make the model emit tool/thinking protocol as user
+// visible text. Automatic recovery therefore restarts from the latest real
+// user message plus top-level instructions. The explicit
+// X-Copilot-Continuation-Degrade opt-in still owns lossy prose degradation.
 func ResponsesToMessages(bodyBytes []byte) ([]byte, TranslateStats, error) {
 	var src map[string]interface{}
 	if err := json.Unmarshal(bodyBytes, &src); err != nil {
@@ -100,15 +101,15 @@ func ResponsesToMessages(bodyBytes []byte) ([]byte, TranslateStats, error) {
 }
 
 // translateResponsesInputToAnthropic walks Responses input[] and emits an
-// Anthropic messages[] array. function_call items flatten to assistant text,
-// function_call_output items flatten to user text, and a trailing "continue"
-// user signal is synthesized if the tail isn't already a real user utterance.
-// See flatBuilder for adjacency/merge rules.
+// Anthropic messages[] array for automatic recovery. It keeps only the latest
+// real user message and drops reasoning/function-call history so protocol
+// artifacts do not become natural-language context.
 func translateResponsesInputToAnthropic(raw interface{}, stats *TranslateStats) []interface{} {
 	input := normalizeInput(raw)
 	stats.InputItems = len(input)
 
 	flat := newFlatBuilder()
+	var lastUser map[string]interface{}
 
 	for _, item := range input {
 		itemMap, ok := item.(map[string]interface{})
@@ -124,31 +125,28 @@ func translateResponsesInputToAnthropic(raw interface{}, stats *TranslateStats) 
 			continue
 
 		case itemType == "function_call":
-			name := asString(itemMap["name"])
-			args := asString(itemMap["arguments"])
-			if callID := asString(itemMap["call_id"]); callID != "" && name != "" {
-				flat.rememberToolName(callID, name)
-			}
-			flat.appendToolCallText(formatToolCallMarker(name, args))
+			continue
 
 		case itemType == "function_call_output":
-			callID := asString(itemMap["call_id"])
-			output := extractFunctionCallOutput(itemMap["output"])
-			name := flat.toolName(callID)
-			flat.appendToolResultText(formatToolResultMarker(name, output))
+			continue
 
 		case itemType == "message" || (itemType == "" && role != ""):
-			if msg := translateMessageForAnthropic(itemMap); msg != nil {
-				flat.appendRealMessage(msg)
+			if role == "user" {
+				if msg := translateMessageForAnthropic(itemMap); msg != nil {
+					lastUser = msg
+				}
 			}
 
 		default:
-			if role != "" {
+			if role == "user" {
 				if msg := translateMessageForAnthropic(itemMap); msg != nil {
-					flat.appendRealMessage(msg)
+					lastUser = msg
 				}
 			}
 		}
+	}
+	if lastUser != nil {
+		flat.appendRealMessage(lastUser)
 	}
 
 	return flat.finalize()
@@ -350,4 +348,3 @@ func translateToolChoiceForAnthropic(tc interface{}) map[string]interface{} {
 		return nil
 	}
 }
-

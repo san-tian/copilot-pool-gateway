@@ -57,7 +57,7 @@ func TestResponsesToChat_InstructionsBecomeSystem(t *testing.T) {
 	}
 }
 
-func TestResponsesToChat_FunctionCallFlattenedAfterRealAssistant(t *testing.T) {
+func TestResponsesToChat_ToolHistoryDroppedAfterRealAssistant(t *testing.T) {
 	body := map[string]interface{}{
 		"model": "gpt-5",
 		"input": []interface{}{
@@ -69,46 +69,20 @@ func TestResponsesToChat_FunctionCallFlattenedAfterRealAssistant(t *testing.T) {
 	}
 	chat, _ := mustTranslate(t, body)
 	msgs := chat["messages"].([]interface{})
-	// Real assistant content is never mutated; flattened tool history opens a
-	// new synthetic assistant turn, then a user tool-result turn, and the
-	// trailing function_call_output triggers "continue" merge.
-	if len(msgs) != 4 {
-		t.Fatalf("want 4 messages, got %d: %+v", len(msgs), msgs)
+	if len(msgs) != 1 {
+		t.Fatalf("want latest user message only, got %d: %+v", len(msgs), msgs)
 	}
 
-	realAsst := msgs[1].(map[string]interface{})
-	if realAsst["role"] != "assistant" || realAsst["content"] != "Sure." {
-		t.Fatalf("real assistant should pass through verbatim, got %+v", realAsst)
+	user := msgs[0].(map[string]interface{})
+	if user["role"] != "user" || user["content"] != "list files" {
+		t.Fatalf("should restart from real user message, got %+v", user)
 	}
-	if _, leaked := realAsst["tool_calls"]; leaked {
-		t.Fatalf("real assistant must not carry tool_calls, got %+v", realAsst)
-	}
-
-	synAsst := msgs[2].(map[string]interface{})
-	if synAsst["role"] != "assistant" {
-		t.Fatalf("third msg should be synthetic assistant, got %+v", synAsst)
-	}
-	if synAsst["content"] != `[Tool call: Read({"p":"a"})]` {
-		t.Fatalf("synthetic assistant content wrong: %q", synAsst["content"])
-	}
-	if _, leaked := synAsst["tool_calls"]; leaked {
-		t.Fatalf("flattened path must not emit tool_calls, got %+v", synAsst)
-	}
-
-	toolUser := msgs[3].(map[string]interface{})
-	if toolUser["role"] != "user" {
-		t.Fatalf("last msg should be user (tool-result + continue), got %+v", toolUser)
-	}
-	got := toolUser["content"].(string)
-	if !strings.Contains(got, "[Tool `Read` returned: content]") {
-		t.Fatalf("user content missing tool-result marker: %q", got)
-	}
-	if !strings.HasSuffix(got, "continue") {
-		t.Fatalf("tail function_call_output should trigger continue suffix, got %q", got)
+	if strings.Contains(user["content"].(string), "Tool call") || strings.Contains(user["content"].(string), "returned") {
+		t.Fatalf("tool history must not leak into user content: %q", user["content"])
 	}
 }
 
-func TestResponsesToChat_FunctionCallWithoutPriorAssistantOpensSyntheticOne(t *testing.T) {
+func TestResponsesToChat_FunctionCallWithoutPriorAssistantDropped(t *testing.T) {
 	body := map[string]interface{}{
 		"model": "gpt-5",
 		"input": []interface{}{
@@ -119,27 +93,16 @@ func TestResponsesToChat_FunctionCallWithoutPriorAssistantOpensSyntheticOne(t *t
 	}
 	chat, _ := mustTranslate(t, body)
 	msgs := chat["messages"].([]interface{})
-	if len(msgs) != 3 {
-		t.Fatalf("want 3 messages, got %d: %+v", len(msgs), msgs)
+	if len(msgs) != 1 {
+		t.Fatalf("want latest user message only, got %d: %+v", len(msgs), msgs)
 	}
-	asst := msgs[1].(map[string]interface{})
-	if asst["role"] != "assistant" || asst["content"] != "[Tool call: N({})]" {
-		t.Fatalf("synthetic assistant wrong: %+v", asst)
-	}
-	if _, leaked := asst["tool_calls"]; leaked {
-		t.Fatalf("flattened path must not emit tool_calls: %+v", asst)
-	}
-	tail := msgs[2].(map[string]interface{})
-	if tail["role"] != "user" {
-		t.Fatalf("tail should be user, got %+v", tail)
-	}
-	tc := tail["content"].(string)
-	if !strings.Contains(tc, "[Tool `N` returned: ok]") || !strings.HasSuffix(tc, "continue") {
-		t.Fatalf("tail content wrong: %q", tc)
+	user := msgs[0].(map[string]interface{})
+	if user["role"] != "user" || user["content"] != "x" {
+		t.Fatalf("should restart from real user message, got %+v", user)
 	}
 }
 
-func TestResponsesToChat_MultipleFunctionCallsStackIntoOneAssistantTurn(t *testing.T) {
+func TestResponsesToChat_MultipleFunctionCallsDropped(t *testing.T) {
 	body := map[string]interface{}{
 		"model": "gpt-5",
 		"input": []interface{}{
@@ -153,25 +116,12 @@ func TestResponsesToChat_MultipleFunctionCallsStackIntoOneAssistantTurn(t *testi
 	}
 	chat, _ := mustTranslate(t, body)
 	msgs := chat["messages"].([]interface{})
-	// user, real assistant, synthetic assistant (A+B merged), user (a+b merged + continue)
-	if len(msgs) != 4 {
-		t.Fatalf("want 4 messages, got %d: %+v", len(msgs), msgs)
+	if len(msgs) != 1 {
+		t.Fatalf("want latest user message only, got %d: %+v", len(msgs), msgs)
 	}
-	synAsst := msgs[2].(map[string]interface{})
-	if synAsst["role"] != "assistant" {
-		t.Fatalf("third msg should be synthetic assistant, got %+v", synAsst)
-	}
-	sc := synAsst["content"].(string)
-	if !strings.Contains(sc, "[Tool call: A({})]") || !strings.Contains(sc, "[Tool call: B({})]") {
-		t.Fatalf("adjacent tool_calls should merge into one assistant turn: %q", sc)
-	}
-	tail := msgs[3].(map[string]interface{})
-	tc := tail["content"].(string)
-	if !strings.Contains(tc, "[Tool `A` returned: a]") || !strings.Contains(tc, "[Tool `B` returned: b]") {
-		t.Fatalf("adjacent tool_results should merge into one user turn: %q", tc)
-	}
-	if !strings.HasSuffix(tc, "continue") {
-		t.Fatalf("tail function_call_output should trigger continue suffix: %q", tc)
+	user := msgs[0].(map[string]interface{})
+	if user["role"] != "user" || user["content"] != "do two things" {
+		t.Fatalf("should restart from real user message, got %+v", user)
 	}
 }
 
@@ -191,8 +141,12 @@ func TestResponsesToChat_ReasoningDropped(t *testing.T) {
 		t.Fatalf("dropped reasoning want 2 got %d", stats.DroppedReasoning)
 	}
 	msgs := chat["messages"].([]interface{})
-	if len(msgs) != 3 {
-		t.Fatalf("reasoning should be stripped, got %d messages: %+v", len(msgs), msgs)
+	if len(msgs) != 1 {
+		t.Fatalf("recovery should keep latest user only, got %d messages: %+v", len(msgs), msgs)
+	}
+	only := msgs[0].(map[string]interface{})
+	if only["role"] != "user" || only["content"] != "and again" {
+		t.Fatalf("latest user message wrong: %+v", only)
 	}
 }
 
@@ -355,18 +309,18 @@ func TestResponsesToChat_FunctionCallOutputNonString(t *testing.T) {
 	msgs := chat["messages"].([]interface{})
 	tail := msgs[len(msgs)-1].(map[string]interface{})
 	if tail["role"] != "user" {
-		t.Fatalf("tail should be user (flattened tool-result), got %+v", tail)
+		t.Fatalf("tail should be user, got %+v", tail)
 	}
 	content := tail["content"].(string)
-	if !strings.Contains(content, `"result"`) || !strings.Contains(content, `"ok"`) {
-		t.Fatalf("non-string output should JSON-stringify into user content, got: %q", content)
+	if content != "x" {
+		t.Fatalf("tool output must be dropped, got: %q", content)
 	}
-	if !strings.Contains(content, "[Tool `N` returned:") {
-		t.Fatalf("content should carry tool-result marker with tool name, got: %q", content)
+	if strings.Contains(content, `"result"`) || strings.Contains(content, "Tool") {
+		t.Fatalf("tool output leaked into user content: %q", content)
 	}
 }
 
-func TestResponsesToChat_TailFunctionCallOutputSynthesizesContinue(t *testing.T) {
+func TestResponsesToChat_TailFunctionCallOutputDroppedWhenUserExists(t *testing.T) {
 	// Last input item is a function_call_output — agent loop continuation.
 	// Model needs a user "continue" signal or it has nothing to respond to.
 	body := map[string]interface{}{
@@ -384,13 +338,8 @@ func TestResponsesToChat_TailFunctionCallOutputSynthesizesContinue(t *testing.T)
 		t.Fatalf("tail must be user role, got %+v", tail)
 	}
 	content := tail["content"].(string)
-	if !strings.HasSuffix(content, "continue") {
-		t.Fatalf("tail content should end with continue, got: %q", content)
-	}
-	// Continue should merge into the existing tool-result turn (no separate
-	// turn appended).
-	if !strings.Contains(content, "[Tool `N` returned: done]") {
-		t.Fatalf("continue should merge into existing tool-result turn, got: %q", content)
+	if content != "x" {
+		t.Fatalf("should restart from latest user and drop tool output, got: %q", content)
 	}
 }
 
@@ -430,12 +379,12 @@ func TestResponsesToChat_DanglingFunctionCallAppendsUserTurn(t *testing.T) {
 	}
 	chat, _ := mustTranslate(t, body)
 	msgs := chat["messages"].([]interface{})
-	if len(msgs) != 3 {
-		t.Fatalf("want 3 messages (user, synth assistant, continue user), got %d: %+v", len(msgs), msgs)
+	if len(msgs) != 1 {
+		t.Fatalf("want latest user message only, got %d: %+v", len(msgs), msgs)
 	}
-	tail := msgs[2].(map[string]interface{})
-	if tail["role"] != "user" || tail["content"] != "continue" {
-		t.Fatalf("tail should be fresh user 'continue' turn, got %+v", tail)
+	tail := msgs[0].(map[string]interface{})
+	if tail["role"] != "user" || tail["content"] != "x" {
+		t.Fatalf("tail should be original user turn, got %+v", tail)
 	}
 }
 

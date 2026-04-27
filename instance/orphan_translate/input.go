@@ -39,13 +39,13 @@ type TranslateStats struct {
 //
 // Non-function tools (web_search, image_generation) are dropped.
 //
-// Prior tool history is FLATTENED into conversation prose: function_call
-// items become "[Tool call: name(args)]" text inside an assistant turn, and
-// function_call_output items become "[Tool `name` returned: output]" text
-// inside a user turn. The current-turn `tools` array still passes through
-// so the model can issue fresh tool calls. When the input tail is a
-// function_call_output (client-side agent loop continuation), synthesize a
-// trailing user "continue" signal so the model knows to keep going.
+// Prior reasoning and tool history is dropped instead of flattened into
+// ordinary prose. If the original Responses structure cannot be replayed on
+// the bound connection, prose markers such as "[Tool call: ...]" pollute the
+// next model turn and can make the model emit tool/thinking protocol as user
+// visible text. Automatic recovery therefore restarts from the latest real
+// user message plus top-level instructions. The explicit
+// X-Copilot-Continuation-Degrade opt-in still owns lossy prose degradation.
 func ResponsesToChat(bodyBytes []byte) ([]byte, TranslateStats, error) {
 	var src map[string]interface{}
 	if err := json.Unmarshal(bodyBytes, &src); err != nil {
@@ -83,6 +83,7 @@ func ResponsesToChat(bodyBytes []byte) ([]byte, TranslateStats, error) {
 	input := normalizeInput(src["input"])
 	stats.InputItems = len(input)
 
+	var lastUser map[string]interface{}
 	for _, item := range input {
 		itemMap, ok := item.(map[string]interface{})
 		if !ok {
@@ -97,31 +98,28 @@ func ResponsesToChat(bodyBytes []byte) ([]byte, TranslateStats, error) {
 			continue
 
 		case itemType == "function_call":
-			name := asString(itemMap["name"])
-			args := asString(itemMap["arguments"])
-			if callID := asString(itemMap["call_id"]); callID != "" && name != "" {
-				flat.rememberToolName(callID, name)
-			}
-			flat.appendToolCallText(formatToolCallMarker(name, args))
+			continue
 
 		case itemType == "function_call_output":
-			callID := asString(itemMap["call_id"])
-			output := extractFunctionCallOutput(itemMap["output"])
-			name := flat.toolName(callID)
-			flat.appendToolResultText(formatToolResultMarker(name, output))
+			continue
 
 		case itemType == "message" || (itemType == "" && role != ""):
-			if msg := translateMessage(itemMap); msg != nil {
-				flat.appendRealMessage(msg)
+			if role == "user" {
+				if msg := translateMessage(itemMap); msg != nil {
+					lastUser = msg
+				}
 			}
 
 		default:
-			if role != "" {
+			if role == "user" {
 				if msg := translateMessage(itemMap); msg != nil {
-					flat.appendRealMessage(msg)
+					lastUser = msg
 				}
 			}
 		}
+	}
+	if lastUser != nil {
+		flat.appendRealMessage(lastUser)
 	}
 
 	messages := flat.finalize()
@@ -310,36 +308,7 @@ func asString(v interface{}) string {
 	return s
 }
 
-// formatToolCallMarker renders a function_call history entry as prose. Example:
-//
-//	[Tool call: Read({"p":"a"})]
-//
-// Empty arguments render as the name alone with parens. Both translators use
-// this so the flattened format stays consistent across chat and messages
-// routes.
-func formatToolCallMarker(name, args string) string {
-	trimmedArgs := strings.TrimSpace(args)
-	if trimmedArgs == "" {
-		return "[Tool call: " + name + "()]"
-	}
-	return "[Tool call: " + name + "(" + trimmedArgs + ")]"
-}
-
-// formatToolResultMarker renders a function_call_output history entry as
-// prose. When the tool name is known (tracked by call_id while walking
-// input[]), uses "[Tool `name` returned: output]"; otherwise falls back to
-// "[Tool result: output]".
-func formatToolResultMarker(name, output string) string {
-	if strings.TrimSpace(name) != "" {
-		return "[Tool `" + name + "` returned: " + output + "]"
-	}
-	return "[Tool result: " + output + "]"
-}
-
-// flatTurn is one accumulated turn inside flatBuilder. `origin` tracks where
-// the content came from so finalize* can decide how to append the "continue"
-// signal: merged into a tool-result user turn vs. a fresh user turn after an
-// assistant-terminated input.
+// flatTurn is one accumulated turn inside flatBuilder.
 type flatTurn struct {
 	role   string
 	text   string
@@ -354,58 +323,21 @@ type flatOrigin int
 
 const (
 	originReal flatOrigin = iota
-	originToolCall
-	originToolResult
+	originFallbackUser
 )
 
-// flatBuilder is a small helper both translators use to flatten prior tool
-// history into conversation text. Adjacency merging matches the existing
-// batching rules: successive function_call items stack into one assistant
-// turn, successive function_call_output items stack into one user turn.
+// flatBuilder is a small helper both translators use to build a minimal
+// recovery conversation. Automatic recovery keeps only real user messages;
+// the fallback origin marks a synthesized user prompt when no real user
+// message survives.
 type flatBuilder struct {
-	turns         []flatTurn
-	toolNames     map[string]string // call_id → tool name, populated on function_call
+	turns []flatTurn
 }
 
 func newFlatBuilder() *flatBuilder {
 	return &flatBuilder{
-		turns:     make([]flatTurn, 0, 16),
-		toolNames: make(map[string]string, 4),
+		turns: make([]flatTurn, 0, 4),
 	}
-}
-
-func (b *flatBuilder) rememberToolName(callID, name string) {
-	b.toolNames[callID] = name
-}
-
-func (b *flatBuilder) toolName(callID string) string {
-	return b.toolNames[callID]
-}
-
-// appendToolCallText appends flattened function_call text to the trailing
-// assistant turn, opening one if the last turn isn't a suitable assistant
-// carrier.
-func (b *flatBuilder) appendToolCallText(text string) {
-	b.appendGeneratedText("assistant", originToolCall, text)
-}
-
-// appendToolResultText appends flattened function_call_output text to the
-// trailing user turn, opening one if needed.
-func (b *flatBuilder) appendToolResultText(text string) {
-	b.appendGeneratedText("user", originToolResult, text)
-}
-
-func (b *flatBuilder) appendGeneratedText(role string, origin flatOrigin, text string) {
-	// Merge into trailing turn only if it's same role AND synthetic. Real
-	// messages hold their own content verbatim; don't mutate them.
-	if n := len(b.turns); n > 0 {
-		last := &b.turns[n-1]
-		if last.role == role && last.origin == origin && last.realMsg == nil {
-			last.text = last.text + "\n" + text
-			return
-		}
-	}
-	b.turns = append(b.turns, flatTurn{role: role, origin: origin, text: text})
 }
 
 func (b *flatBuilder) appendRealMessage(msg map[string]interface{}) {
@@ -434,25 +366,15 @@ func (b *flatBuilder) finalize() []interface{} {
 	return out
 }
 
-// appendContinueIfNeeded ensures the final turn is a user turn that looks
-// like a real prompt. Rules:
-//   - Last turn is user + real message: leave alone (real user said something).
-//   - Last turn is user + tool-result origin: merge "\n\ncontinue" into it so
-//     strict alternation stays valid and the model sees a continuation signal.
-//   - Last turn is assistant (real or tool-call origin) or anything else:
-//     append a fresh {role:"user", content:"continue"} turn.
-//   - Empty turns (no input at all): append the continue turn so callers get
-//     a valid payload; higher-level code also has an empty-messages guard.
+// appendContinueIfNeeded ensures the final turn is a user turn. If no real
+// user message survives recovery, append a minimal "continue" prompt instead
+// of surfacing an error to the caller.
 func (b *flatBuilder) appendContinueIfNeeded() {
 	if n := len(b.turns); n > 0 {
 		last := &b.turns[n-1]
 		if last.role == "user" && last.origin == originReal {
 			return
 		}
-		if last.role == "user" && last.origin == originToolResult {
-			last.text = last.text + "\n\ncontinue"
-			return
-		}
 	}
-	b.turns = append(b.turns, flatTurn{role: "user", origin: originToolResult, text: "continue"})
+	b.turns = append(b.turns, flatTurn{role: "user", origin: originFallbackUser, text: "continue"})
 }
