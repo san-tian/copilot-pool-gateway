@@ -109,6 +109,47 @@ func TestSetResponsesSessionAffinityContextPoolOnly(t *testing.T) {
 	}
 }
 
+func TestResponsesRoutingTelemetryCountersAndRecentLimit(t *testing.T) {
+	resetResponsesRoutingTelemetryForTest()
+	defer resetResponsesRoutingTelemetryForTest()
+
+	recordResponsesRoutingEvent(responsesRoutingTelemetryEvent{
+		Kind:          "account_switch_trigger",
+		RequestID:     "rid-1",
+		SessionKey:    "session-hash",
+		SessionSource: "X-Copilot-Pool-Session",
+		Model:         "gpt-5.4",
+		FromAccount:   "acct-a",
+		Reason:        "retryable_status_non_continuation",
+		StatusCode:    http.StatusTooManyRequests,
+	})
+	recordResponsesRoutingEvent(responsesRoutingTelemetryEvent{
+		Kind:        "account_switched",
+		RequestID:   "rid-1",
+		Model:       "gpt-5.4",
+		FromAccount: "acct-a",
+		ToAccount:   "acct-b",
+		AccountID:   "acct-b",
+	})
+
+	snapshot := snapshotResponsesRoutingTelemetry(1)
+	if snapshot.Counters["account_switch_trigger"] != 1 {
+		t.Fatalf("account_switch_trigger counter = %d, want 1", snapshot.Counters["account_switch_trigger"])
+	}
+	if snapshot.Counters["account_switched"] != 1 {
+		t.Fatalf("account_switched counter = %d, want 1", snapshot.Counters["account_switched"])
+	}
+	if snapshot.LastEventAt["account_switch_trigger"] == "" {
+		t.Fatalf("expected last event timestamp for account_switch_trigger")
+	}
+	if len(snapshot.Recent) != 1 {
+		t.Fatalf("recent length = %d, want 1", len(snapshot.Recent))
+	}
+	if got := snapshot.Recent[0].Kind; got != "account_switched" {
+		t.Fatalf("recent[0].kind = %q, want account_switched", got)
+	}
+}
+
 // writeSessionBindingError shapes the three continuation-failure responses
 // that codex / pi clients will observe when strict binding rejects a
 // continuation. Verify status codes, the discriminating `type` field, and

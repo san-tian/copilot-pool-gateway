@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +19,7 @@ import (
 const (
 	responsesSessionAffinityTTL        = 6 * time.Hour
 	responsesSessionAffinityMaxEntries = 4096
+	responsesRoutingTelemetryMaxEvents = 256
 )
 
 type responsesSessionAffinityEntry struct {
@@ -30,6 +32,115 @@ var responsesSessionAffinity = struct {
 	entries map[string]responsesSessionAffinityEntry
 }{
 	entries: map[string]responsesSessionAffinityEntry{},
+}
+
+type responsesRoutingTelemetryEvent struct {
+	Time          string `json:"time"`
+	Kind          string `json:"kind"`
+	RequestID     string `json:"request_id,omitempty"`
+	SessionKey    string `json:"session_key,omitempty"`
+	SessionSource string `json:"session_source,omitempty"`
+	Model         string `json:"model,omitempty"`
+	AccountID     string `json:"account_id,omitempty"`
+	FromAccount   string `json:"from_account,omitempty"`
+	ToAccount     string `json:"to_account,omitempty"`
+	Attempt       int    `json:"attempt,omitempty"`
+	StatusCode    int    `json:"status_code,omitempty"`
+	Reason        string `json:"reason,omitempty"`
+	StickyKind    string `json:"sticky_kind,omitempty"`
+	RecoveryRoute string `json:"recovery_route,omitempty"`
+	Mode          string `json:"mode,omitempty"`
+	Continuation  bool   `json:"continuation,omitempty"`
+}
+
+type responsesRoutingTelemetrySnapshot struct {
+	StartedAt   string                           `json:"started_at"`
+	UpdatedAt   string                           `json:"updated_at,omitempty"`
+	Counters    map[string]uint64                `json:"counters"`
+	LastEventAt map[string]string                `json:"last_event_at"`
+	Recent      []responsesRoutingTelemetryEvent `json:"recent"`
+}
+
+var responsesRoutingTelemetry = struct {
+	mu        sync.Mutex
+	startedAt time.Time
+	updatedAt time.Time
+	counters  map[string]uint64
+	lastAt    map[string]time.Time
+	recent    []responsesRoutingTelemetryEvent
+}{
+	startedAt: time.Now().UTC(),
+	counters:  map[string]uint64{},
+	lastAt:    map[string]time.Time{},
+	recent:    []responsesRoutingTelemetryEvent{},
+}
+
+func recordResponsesRoutingEvent(event responsesRoutingTelemetryEvent) {
+	event.Kind = strings.TrimSpace(event.Kind)
+	if event.Kind == "" {
+		return
+	}
+	now := time.Now().UTC()
+	event.Time = now.Format(time.RFC3339Nano)
+	responsesRoutingTelemetry.mu.Lock()
+	responsesRoutingTelemetry.updatedAt = now
+	responsesRoutingTelemetry.counters[event.Kind]++
+	responsesRoutingTelemetry.lastAt[event.Kind] = now
+	responsesRoutingTelemetry.recent = append(responsesRoutingTelemetry.recent, event)
+	if len(responsesRoutingTelemetry.recent) > responsesRoutingTelemetryMaxEvents {
+		copy(responsesRoutingTelemetry.recent, responsesRoutingTelemetry.recent[len(responsesRoutingTelemetry.recent)-responsesRoutingTelemetryMaxEvents:])
+		responsesRoutingTelemetry.recent = responsesRoutingTelemetry.recent[:responsesRoutingTelemetryMaxEvents]
+	}
+	responsesRoutingTelemetry.mu.Unlock()
+
+	log.Printf("[responses metric] kind=%s time=%s rid=%s session_source=%q session_key=%q model=%q account=%q from=%q to=%q attempt=%d status=%d reason=%q sticky=%q recovery_route=%q mode=%q continuation=%v",
+		event.Kind, event.Time, event.RequestID, event.SessionSource, event.SessionKey, event.Model, event.AccountID,
+		event.FromAccount, event.ToAccount, event.Attempt, event.StatusCode, event.Reason, event.StickyKind,
+		event.RecoveryRoute, event.Mode, event.Continuation)
+}
+
+func snapshotResponsesRoutingTelemetry(limit int) responsesRoutingTelemetrySnapshot {
+	if limit <= 0 || limit > responsesRoutingTelemetryMaxEvents {
+		limit = responsesRoutingTelemetryMaxEvents
+	}
+	responsesRoutingTelemetry.mu.Lock()
+	defer responsesRoutingTelemetry.mu.Unlock()
+
+	counters := make(map[string]uint64, len(responsesRoutingTelemetry.counters))
+	for k, v := range responsesRoutingTelemetry.counters {
+		counters[k] = v
+	}
+	lastAt := make(map[string]string, len(responsesRoutingTelemetry.lastAt))
+	for k, v := range responsesRoutingTelemetry.lastAt {
+		lastAt[k] = v.Format(time.RFC3339Nano)
+	}
+	recent := responsesRoutingTelemetry.recent
+	if len(recent) > limit {
+		recent = recent[len(recent)-limit:]
+	}
+	recentCopy := make([]responsesRoutingTelemetryEvent, len(recent))
+	copy(recentCopy, recent)
+	updatedAt := ""
+	if !responsesRoutingTelemetry.updatedAt.IsZero() {
+		updatedAt = responsesRoutingTelemetry.updatedAt.Format(time.RFC3339Nano)
+	}
+	return responsesRoutingTelemetrySnapshot{
+		StartedAt:   responsesRoutingTelemetry.startedAt.Format(time.RFC3339Nano),
+		UpdatedAt:   updatedAt,
+		Counters:    counters,
+		LastEventAt: lastAt,
+		Recent:      recentCopy,
+	}
+}
+
+func resetResponsesRoutingTelemetryForTest() {
+	responsesRoutingTelemetry.mu.Lock()
+	defer responsesRoutingTelemetry.mu.Unlock()
+	responsesRoutingTelemetry.startedAt = time.Now().UTC()
+	responsesRoutingTelemetry.updatedAt = time.Time{}
+	responsesRoutingTelemetry.counters = map[string]uint64{}
+	responsesRoutingTelemetry.lastAt = map[string]time.Time{}
+	responsesRoutingTelemetry.recent = []responsesRoutingTelemetryEvent{}
 }
 
 func responsesSessionAffinityKey(c *gin.Context, body []byte) (string, string) {
@@ -111,6 +222,13 @@ func lookupResponsesSessionAffinity(key, requestedModel string, exclude map[stri
 	if !ok || now.Sub(entry.AccessedAt) > responsesSessionAffinityTTL {
 		if ok {
 			delete(responsesSessionAffinity.entries, key)
+			recordResponsesRoutingEvent(responsesRoutingTelemetryEvent{
+				Kind:       "session_affinity_forget",
+				SessionKey: key,
+				Model:      requestedModel,
+				AccountID:  entry.AccountID,
+				Reason:     "expired",
+			})
 		}
 		responsesSessionAffinity.mu.Unlock()
 		return nil
@@ -120,20 +238,48 @@ func lookupResponsesSessionAffinity(key, requestedModel string, exclude map[stri
 	responsesSessionAffinity.mu.Unlock()
 
 	if exclude != nil && exclude[entry.AccountID] {
+		recordResponsesRoutingEvent(responsesRoutingTelemetryEvent{
+			Kind:       "session_affinity_ignored",
+			SessionKey: key,
+			Model:      requestedModel,
+			AccountID:  entry.AccountID,
+			Reason:     "excluded",
+		})
 		return nil
 	}
 	if store.IsModelBlocked(entry.AccountID, requestedModel) {
 		forgetResponsesSessionAffinity(key, entry.AccountID)
+		recordResponsesRoutingEvent(responsesRoutingTelemetryEvent{
+			Kind:       "session_affinity_forget",
+			SessionKey: key,
+			Model:      requestedModel,
+			AccountID:  entry.AccountID,
+			Reason:     "model_blocked",
+		})
 		return nil
 	}
 	account, _ := store.GetAccount(entry.AccountID)
 	if account == nil || !account.Enabled {
 		forgetResponsesSessionAffinity(key, entry.AccountID)
+		recordResponsesRoutingEvent(responsesRoutingTelemetryEvent{
+			Kind:       "session_affinity_forget",
+			SessionKey: key,
+			Model:      requestedModel,
+			AccountID:  entry.AccountID,
+			Reason:     "account_disabled_or_missing",
+		})
 		return nil
 	}
 	state := instance.GetInstanceState(entry.AccountID)
 	if state == nil {
 		forgetResponsesSessionAffinity(key, entry.AccountID)
+		recordResponsesRoutingEvent(responsesRoutingTelemetryEvent{
+			Kind:       "session_affinity_forget",
+			SessionKey: key,
+			Model:      requestedModel,
+			AccountID:  entry.AccountID,
+			Reason:     "instance_not_running",
+		})
 		return nil
 	}
 	return &resolvedAccount{State: state, AccountID: entry.AccountID}

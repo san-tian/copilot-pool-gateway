@@ -1369,6 +1369,33 @@ func proxyResponses(c *gin.Context) {
 	if s, ok := c.Get("responsesSessionAffinitySource"); ok {
 		affinitySource, _ = s.(string)
 	}
+	affinityKey := ""
+	if s, ok := c.Get("responsesSessionAffinityKey"); ok {
+		affinityKey, _ = s.(string)
+	}
+	pendingSwitchFrom := ""
+	pendingSwitchReason := ""
+	pendingSwitchStatus := 0
+	recordSwitchTrigger := func(attempt int, fromAccount string, reason string, status int, mode string) {
+		pendingSwitchFrom = fromAccount
+		pendingSwitchReason = reason
+		pendingSwitchStatus = status
+		recordResponsesRoutingEvent(responsesRoutingTelemetryEvent{
+			Kind:          "account_switch_trigger",
+			RequestID:     reqID,
+			SessionKey:    affinityKey,
+			SessionSource: affinitySource,
+			Model:         requestedModel,
+			AccountID:     fromAccount,
+			FromAccount:   fromAccount,
+			Attempt:       attempt,
+			StatusCode:    status,
+			Reason:        reason,
+			RecoveryRoute: recovery.Route.logName(),
+			Mode:          mode,
+			Continuation:  continuationRequested,
+		})
+	}
 	prevStickyReplay, prevStickyReplayOK := "", false
 	prevStickyTurn, prevStickyTurnOK := "", false
 	if previousResponseID != "" {
@@ -1430,6 +1457,17 @@ func proxyResponses(c *gin.Context) {
 			// (409/503) when flatten isn't armable.
 			recovery = resolveOrphanRecoveryState(c, requestedModel, exclude, binding.Reason, binding.AccountID)
 			if recovery.armed() && len(functionCallOutputIDs) > 0 {
+				recordResponsesRoutingEvent(responsesRoutingTelemetryEvent{
+					Kind:          "recovery_route_armed",
+					RequestID:     reqID,
+					SessionKey:    affinityKey,
+					SessionSource: affinitySource,
+					Model:         requestedModel,
+					FromAccount:   binding.AccountID,
+					Reason:        binding.Reason,
+					RecoveryRoute: recovery.Route.logName(),
+					Continuation:  true,
+				})
 				log.Printf("[responses rid=%s] recovery armed binding_kind=%d recovery_route=%s recovery_from_account=%q hits=%d misses=%d fc_ids=%d accounts=%v reason=%q",
 					reqID, binding.Kind, recovery.Route.logName(), recovery.FromAccount, binding.HitCount, binding.MissCount, len(functionCallOutputIDs), binding.SplitAccounts, binding.Reason)
 				previousResponseID = ""
@@ -1473,6 +1511,16 @@ func proxyResponses(c *gin.Context) {
 				// stateful /v1/responses upstream.
 				recovery = resolveOrphanRecoveryState(c, requestedModel, exclude, binding.Reason, "")
 				if recovery.armed() {
+					recordResponsesRoutingEvent(responsesRoutingTelemetryEvent{
+						Kind:          "recovery_route_armed",
+						RequestID:     reqID,
+						SessionKey:    affinityKey,
+						SessionSource: affinitySource,
+						Model:         requestedModel,
+						Reason:        binding.Reason,
+						RecoveryRoute: recovery.Route.logName(),
+						Continuation:  true,
+					})
 					log.Printf("[responses rid=%s] recovery armed binding_kind=%d recovery_route=%s recovery_from_account=%q model=%q reason=%q",
 						reqID, binding.Kind, recovery.Route.logName(), recovery.FromAccount, requestedModel, recovery.Reason)
 				} else if config.ResponsesOrphanTranslate() == "on" {
@@ -1530,6 +1578,30 @@ func proxyResponses(c *gin.Context) {
 			log.Printf("[responses rid=%s attempt=%d] resolve failed; error already written", reqID, attempt)
 			return
 		}
+		if pendingSwitchFrom != "" {
+			kind := "account_switch_avoided"
+			if pendingSwitchFrom != resolved.AccountID {
+				kind = "account_switched"
+			}
+			recordResponsesRoutingEvent(responsesRoutingTelemetryEvent{
+				Kind:          kind,
+				RequestID:     reqID,
+				SessionKey:    affinityKey,
+				SessionSource: affinitySource,
+				Model:         requestedModel,
+				AccountID:     resolved.AccountID,
+				FromAccount:   pendingSwitchFrom,
+				ToAccount:     resolved.AccountID,
+				Attempt:       attempt,
+				StatusCode:    pendingSwitchStatus,
+				Reason:        pendingSwitchReason,
+				RecoveryRoute: recovery.Route.logName(),
+				Continuation:  continuationRequested,
+			})
+			pendingSwitchFrom = ""
+			pendingSwitchReason = ""
+			pendingSwitchStatus = 0
+		}
 
 		affinityStatus := ""
 		if s, ok := c.Get("responsesSessionAffinityStatus"); ok {
@@ -1537,6 +1609,20 @@ func proxyResponses(c *gin.Context) {
 		}
 		if affinityStatus == "hit" && stickyKind == "fallback_round_robin" {
 			stickyKind = "session_affinity"
+		}
+		if affinityStatus == "bind" || affinityStatus == "hit" {
+			recordResponsesRoutingEvent(responsesRoutingTelemetryEvent{
+				Kind:          "session_affinity_" + affinityStatus,
+				RequestID:     reqID,
+				SessionKey:    affinityKey,
+				SessionSource: affinitySource,
+				Model:         requestedModel,
+				AccountID:     resolved.AccountID,
+				Attempt:       attempt,
+				StickyKind:    stickyKind,
+				RecoveryRoute: recovery.Route.logName(),
+				Continuation:  continuationRequested,
+			})
 		}
 		log.Printf("[responses rid=%s attempt=%d] resolved account=%s sticky_kind=%s fell_back=%v cross_rollover=%v session_affinity=%q exclude=%v recovery_route=%s recovery_from_account=%q recovery_to_account=%q recovery_reason=%q",
 			reqID, attempt, resolved.AccountID, stickyKind, fellBackToPool, crossAccountRollover, affinityStatus, exclude,
@@ -1606,11 +1692,13 @@ func proxyResponses(c *gin.Context) {
 				if continuationRequested && continuationCanDetach && isPool == true {
 					exclude[resolved.AccountID] = true
 					crossAccountRollover = true
+					recordSwitchTrigger(attempt, resolved.AccountID, "proxy_error_detached_continuation", 0, modeName)
 					log.Printf("[responses rid=%s attempt=%d] detached continuation failed on account=%s mode=%s, rolling over cross-account: %v", reqID, attempt, resolved.AccountID, modeName, proxyErr)
 					continue
 				}
 				if !continuationRequested {
 					exclude[resolved.AccountID] = true
+					recordSwitchTrigger(attempt, resolved.AccountID, "proxy_error_non_continuation", 0, modeName)
 					log.Printf("[responses rid=%s attempt=%d] proxy error on account=%s mode=%s, retrying: %v", reqID, attempt, resolved.AccountID, modeName, proxyErr)
 					continue
 				}
@@ -1626,6 +1714,7 @@ func proxyResponses(c *gin.Context) {
 			if continuationRequested && continuationCanDetach && attempt < attemptLimit-1 && isPool == true {
 				exclude[resolved.AccountID] = true
 				crossAccountRollover = true
+				recordSwitchTrigger(attempt, resolved.AccountID, "replay_invalid_detached_continuation", resp.StatusCode, modeName)
 				log.Printf("[responses rid=%s attempt=%d] replay-invalid on account=%s mode=%s, rolling over cross-account; detail=%q",
 					reqID, attempt, resolved.AccountID, modeName, truncateForLog(detail, 240))
 				continue
@@ -1645,6 +1734,7 @@ func proxyResponses(c *gin.Context) {
 					bodyBytes = degradedBody
 					orphanDegraded = true
 					exclude[resolved.AccountID] = true
+					recordSwitchTrigger(attempt, resolved.AccountID, "orphan_degrade_retry", resp.StatusCode, modeName)
 					previousResponseID = ""
 					functionCallOutputIDs = nil
 					continuationRequested = false
@@ -1671,6 +1761,22 @@ func proxyResponses(c *gin.Context) {
 			if !orphanDegraded && !recovery.armed() {
 				recovery = resolveOrphanRecoveryState(c, requestedModel, exclude, "upstream rejected continuation", resolved.AccountID)
 				if recovery.armed() {
+					recordResponsesRoutingEvent(responsesRoutingTelemetryEvent{
+						Kind:          "recovery_route_armed",
+						RequestID:     reqID,
+						SessionKey:    affinityKey,
+						SessionSource: affinitySource,
+						Model:         requestedModel,
+						AccountID:     resolved.AccountID,
+						FromAccount:   resolved.AccountID,
+						ToAccount:     resolved.AccountID,
+						Attempt:       attempt,
+						StatusCode:    resp.StatusCode,
+						Reason:        "upstream_replay_invalid",
+						RecoveryRoute: recovery.Route.logName(),
+						Mode:          modeName,
+						Continuation:  true,
+					})
 					orphanDegraded = true
 					if attempt >= attemptLimit-1 {
 						attemptLimit++
@@ -1689,6 +1795,7 @@ func proxyResponses(c *gin.Context) {
 			}
 			if recovery.armed() && isPool == true && attempt < attemptLimit-1 {
 				exclude[resolved.AccountID] = true
+				recordSwitchTrigger(attempt, resolved.AccountID, "recovery_replay_invalid", resp.StatusCode, modeName)
 				log.Printf("[responses rid=%s attempt=%d] replay-invalid during recovery route=%s account=%s, retrying different account; detail=%q",
 					reqID, attempt, recovery.Route.logName(), resolved.AccountID, truncateForLog(detail, 240))
 				continue
@@ -1709,11 +1816,13 @@ func proxyResponses(c *gin.Context) {
 				if continuationRequested && continuationCanDetach && isPool == true {
 					exclude[resolved.AccountID] = true
 					crossAccountRollover = true
+					recordSwitchTrigger(attempt, resolved.AccountID, "account_disabled_detached_continuation", resp.StatusCode, modeName)
 					log.Printf("[responses rid=%s attempt=%d] disabled account=%s after detached continuation error (%s), rolling over cross-account", reqID, attempt, resolved.AccountID, reason)
 					continue
 				}
 				if !continuationRequested {
 					exclude[resolved.AccountID] = true
+					recordSwitchTrigger(attempt, resolved.AccountID, "account_disabled_non_continuation", resp.StatusCode, modeName)
 					log.Printf("[responses rid=%s attempt=%d] disabled account=%s after upstream error (%s), retrying", reqID, attempt, resolved.AccountID, reason)
 					continue
 				}
@@ -1738,6 +1847,7 @@ func proxyResponses(c *gin.Context) {
 			if refreshErr := instance.ForceRefreshToken(resolved.AccountID); refreshErr != nil {
 				log.Printf("[responses rid=%s attempt=%d] 401 on account=%s: token refresh failed (%v), falling back to cross-account retry", reqID, attempt, resolved.AccountID, refreshErr)
 				exclude[resolved.AccountID] = true
+				recordSwitchTrigger(attempt, resolved.AccountID, "token_refresh_failed", resp.StatusCode, modeName)
 				if continuationRequested && continuationCanDetach && isPool == true {
 					crossAccountRollover = true
 				}
@@ -1761,11 +1871,13 @@ func proxyResponses(c *gin.Context) {
 			if continuationRequested && continuationCanDetach && isPool == true {
 				exclude[resolved.AccountID] = true
 				crossAccountRollover = true
+				recordSwitchTrigger(attempt, resolved.AccountID, "retryable_status_detached_continuation", resp.StatusCode, modeName)
 				log.Printf("[responses rid=%s attempt=%d] upstream %d on account=%s mode=%s, rolling over cross-account", reqID, attempt, resp.StatusCode, resolved.AccountID, modeName)
 				continue
 			}
 			if !continuationRequested {
 				exclude[resolved.AccountID] = true
+				recordSwitchTrigger(attempt, resolved.AccountID, "retryable_status_non_continuation", resp.StatusCode, modeName)
 				log.Printf("[responses rid=%s attempt=%d] upstream %d on account=%s, retrying with different account", reqID, attempt, resp.StatusCode, resolved.AccountID)
 				continue
 			}

@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"copilot-go/auth"
@@ -118,6 +119,7 @@ func registerProtectedConsoleAPI(protected *gin.RouterGroup, proxyPort int) {
 	// Proxy usage stats (from in-memory tracking)
 	protected.GET("/usage", handleGetProxyUsage)
 	protected.GET("/usage/:id", handleGetProxyAccountUsage)
+	protected.GET("/responses-routing-stats", handleGetResponsesRoutingStats)
 
 	// Claude Code command generator
 	protected.POST("/claude-code-command", handleClaudeCodeCommand(proxyPort))
@@ -144,6 +146,11 @@ func registerPublicConsoleAPI(api *gin.RouterGroup, proxyPort int) {
 	api.POST("/public/auth/start", handleStartPublicAuth)
 	api.GET("/public/auth/poll/:sessionId", handlePollPublicAuth)
 	api.POST("/public/auth/complete", handleCompletePublicAuth)
+}
+
+func handleGetResponsesRoutingStats(c *gin.Context) {
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "100"))
+	c.JSON(http.StatusOK, snapshotResponsesRoutingTelemetry(limit))
 }
 
 func adminAuthMiddleware() gin.HandlerFunc {
