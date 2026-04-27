@@ -188,6 +188,36 @@ func responsesSessionAffinityKey(c *gin.Context, body []byte) (string, string) {
 	return "", ""
 }
 
+func responsesRecoveryAffinityKey(requestedModel string, callIDs []string) (string, string) {
+	for _, id := range callIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		model := strings.TrimSpace(requestedModel)
+		return hashAffinityKey("orphan-tool-call-anchor", model+"\x00"+id), "orphan_tool_call_anchor"
+	}
+	return "", ""
+}
+
+func installResponsesRecoveryAffinityContext(c *gin.Context, requestedModel string, callIDs []string) (string, string, bool) {
+	if key, ok := c.Get("responsesSessionAffinityKey"); ok {
+		keyString, _ := key.(string)
+		sourceString := ""
+		if source, ok := c.Get("responsesSessionAffinitySource"); ok {
+			sourceString, _ = source.(string)
+		}
+		return keyString, sourceString, false
+	}
+	key, source := responsesRecoveryAffinityKey(requestedModel, callIDs)
+	if key == "" {
+		return "", "", false
+	}
+	c.Set("responsesSessionAffinityKey", key)
+	c.Set("responsesSessionAffinitySource", source)
+	return key, source, true
+}
+
 func setResponsesSessionAffinityContext(c *gin.Context, isPool interface{}, body []byte) {
 	if isPool != true {
 		return

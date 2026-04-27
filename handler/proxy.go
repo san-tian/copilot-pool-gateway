@@ -1499,6 +1499,14 @@ func proxyResponses(c *gin.Context) {
 			writeSessionBindingError(c, reqID, binding)
 			return
 		case continuationBindingOrphan:
+			if len(functionCallOutputIDs) > 0 {
+				if key, source, installed := installResponsesRecoveryAffinityContext(c, requestedModel, functionCallOutputIDs); installed {
+					affinityKey = key
+					affinitySource = source
+					log.Printf("[responses rid=%s] recovery affinity installed source=%q key=%q model=%q anchor_fc_id=%q",
+						reqID, source, key, requestedModel, functionCallOutputIDs[0])
+				}
+			}
 			// Default-on non-lossy passthrough for cross-relay migration:
 			// when the orphan is a tool-call-output orphan (input is
 			// self-contained, history is present in full), worker mode is

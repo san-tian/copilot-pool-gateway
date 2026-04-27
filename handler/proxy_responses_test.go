@@ -124,6 +124,56 @@ func TestSetResponsesSessionAffinityContextPoolOnly(t *testing.T) {
 	}
 }
 
+func TestResponsesRecoveryAffinityKeyAnchorsOnFirstToolID(t *testing.T) {
+	key1, source1 := responsesRecoveryAffinityKey("gpt-5.4", []string{"call_old", "call_new_1"})
+	key2, source2 := responsesRecoveryAffinityKey("gpt-5.4", []string{"call_old", "call_new_1", "call_new_2"})
+	if key1 == "" || key2 == "" {
+		t.Fatalf("expected recovery affinity keys")
+	}
+	if key1 != key2 {
+		t.Fatalf("same orphan anchor should keep a stable key, got %q and %q", key1, key2)
+	}
+	if source1 != "orphan_tool_call_anchor" || source2 != source1 {
+		t.Fatalf("unexpected sources %q %q", source1, source2)
+	}
+	key3, _ := responsesRecoveryAffinityKey("gpt-5.4", []string{"call_other"})
+	if key3 == key1 {
+		t.Fatalf("different orphan anchors must not collide")
+	}
+}
+
+func TestInstallResponsesRecoveryAffinityContextDoesNotOverrideExplicitSession(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Set("responsesSessionAffinityKey", "explicit-key")
+	c.Set("responsesSessionAffinitySource", "X-Copilot-Pool-Session")
+
+	key, source, installed := installResponsesRecoveryAffinityContext(c, "gpt-5.4", []string{"call_old"})
+	if installed {
+		t.Fatalf("must not install recovery affinity over an explicit session key")
+	}
+	if key != "explicit-key" || source != "X-Copilot-Pool-Session" {
+		t.Fatalf("expected explicit affinity to survive, got key=%q source=%q", key, source)
+	}
+}
+
+func TestInstallResponsesRecoveryAffinityContextInstallsAnchor(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+
+	key, source, installed := installResponsesRecoveryAffinityContext(c, "gpt-5.4", []string{"", "call_old"})
+	if !installed || key == "" {
+		t.Fatalf("expected recovery affinity install, installed=%v key=%q", installed, key)
+	}
+	if source != "orphan_tool_call_anchor" {
+		t.Fatalf("source = %q, want orphan_tool_call_anchor", source)
+	}
+	storedKey, ok := c.Get("responsesSessionAffinityKey")
+	if !ok || storedKey != key {
+		t.Fatalf("context key = %v ok=%v, want %q", storedKey, ok, key)
+	}
+}
+
 func TestResponsesRoutingTelemetryCountersAndRecentLimit(t *testing.T) {
 	resetResponsesRoutingTelemetryForTest()
 	defer resetResponsesRoutingTelemetryForTest()
