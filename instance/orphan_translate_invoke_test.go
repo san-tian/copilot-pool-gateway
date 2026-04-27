@@ -168,9 +168,9 @@ func TestDoOrphanTranslateResponsesProxyWithTurnReusesAgentHeaders(t *testing.T)
 		CacheSource:     "fc_output_id_hit",
 	}
 
-	withStreamingClient(t, &http.Client{
+	withWorkerClient(t, &http.Client{
 		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-			if req.URL.Path != "/chat/completions" {
+			if req.URL.Path != "/v1/chat/completions" {
 				t.Fatalf("path = %q", req.URL.Path)
 			}
 			assertHeaderValue(t, req.Header, "X-Interaction-Type", copilotInteractionTypeAgent)
@@ -347,9 +347,9 @@ func TestDoOrphanTranslateMessagesProxyWithTurnReusesAgentHeaders(t *testing.T) 
 		CacheSource:     "fc_output_id_hit",
 	}
 
-	withStreamingClient(t, &http.Client{
+	withWorkerClient(t, &http.Client{
 		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-			if req.URL.Path != "/chat/completions" {
+			if req.URL.Path != "/v1/messages" {
 				t.Fatalf("path = %q", req.URL.Path)
 			}
 			assertHeaderValue(t, req.Header, "X-Interaction-Type", copilotInteractionTypeAgent)

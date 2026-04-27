@@ -410,14 +410,16 @@ func getWorkerClient() *http.Client {
 	return workerHTTPClient
 }
 
-// copilotHeaderBlocklist lists request headers that must NOT be forwarded to a worker,
-// because the worker re-derives them from its own Copilot session. Keys are lowercased.
+// copilotHeaderBlocklist lists request headers that must NOT be forwarded to a worker.
+// Transport/auth headers always stay local to the worker hop. Copilot turn headers
+// such as X-Interaction-* and X-Initiator are intentionally allowed so the gateway
+// can preserve already-resolved continuation context across the worker boundary.
+// Keys are lowercased.
 var copilotHeaderBlocklist = map[string]struct{}{
 	"authorization":                       {},
 	"editor-version":                      {},
 	"editor-plugin-version":               {},
 	"openai-intent":                       {},
-	"x-initiator":                         {},
 	"x-request-id":                        {},
 	"x-github-api-version":                {},
 	"x-vscode-user-agent-library-version": {},
@@ -447,8 +449,8 @@ func copyNonCopilotHeaders(dst, src http.Header) {
 
 // ProxyRequestViaWorker forwards a request to a per-account sidecar worker (caozhiyuan/copilot-api)
 // bound to loopback. The worker owns payload translation (compact, tool rewrites, stream-id
-// sync, web-search filter) and re-establishes its own Copilot session, so we pass bodyBytes
-// through untouched and strip Copilot-specific request headers before forwarding.
+// sync, web-search filter). When the gateway has already resolved Copilot turn context for a
+// request, it can also forward that context via X-Interaction-* / X-Initiator headers.
 func ProxyRequestViaWorker(ctx context.Context, workerURL, method, path string, bodyBytes []byte, clientHeaders http.Header) (*http.Response, error) {
 	target := strings.TrimRight(workerURL, "/") + path
 	req, err := http.NewRequestWithContext(ctx, method, target, bytes.NewReader(bodyBytes))

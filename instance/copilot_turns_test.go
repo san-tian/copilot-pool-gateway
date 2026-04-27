@@ -8,10 +8,12 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"copilot-go/anthropic"
 	"copilot-go/config"
+	"copilot-go/store"
 
 	"github.com/gin-gonic/gin"
 )
@@ -53,6 +55,31 @@ func withStreamingClient(t *testing.T, client *http.Client) {
 		streamingHTTPClient = prevStreaming
 		defaultHTTPClient = prevDefault
 		clientMu.Unlock()
+	})
+}
+
+func withWorkerClient(t *testing.T, client *http.Client) {
+	t.Helper()
+	prevOnce := workerClientOnce
+	prevClient := workerHTTPClient
+	workerClientOnce = sync.Once{}
+	workerHTTPClient = client
+	workerClientOnce.Do(func() {})
+	t.Cleanup(func() {
+		workerClientOnce = prevOnce
+		workerHTTPClient = prevClient
+	})
+}
+
+func setupWorkerStoreEnv(t *testing.T) {
+	t.Helper()
+	oldAppDir := store.AppDir
+	store.AppDir = t.TempDir()
+	if err := store.EnsurePaths(); err != nil {
+		t.Fatalf("EnsurePaths: %v", err)
+	}
+	t.Cleanup(func() {
+		store.AppDir = oldAppDir
 	})
 }
 
@@ -194,6 +221,53 @@ func TestDoResponsesProxyUsesFunctionCallOutputContextWithoutPreviousResponseID(
 	assertHeaderValue(t, gotReq.Header, "X-Initiator", "agent")
 	assertHeaderValue(t, gotReq.Header, "X-Interaction-Type", copilotInteractionTypeAgent)
 	assertHeaderValue(t, gotReq.Header, "X-Interaction-Id", ctx.InteractionID)
+}
+
+func TestDoResponsesProxyViaWorkerForwardsContinuationHeaders(t *testing.T) {
+	resetCopilotTurnCaches()
+	setupWorkerStoreEnv(t)
+
+	account, err := store.AddAccount("demo", "gh-token", "individual")
+	if err != nil {
+		t.Fatalf("AddAccount: %v", err)
+	}
+	if _, err := store.UpdateAccount(account.ID, map[string]interface{}{"workerUrl": "http://worker.local"}); err != nil {
+		t.Fatalf("UpdateAccount workerUrl: %v", err)
+	}
+
+	ctx := newCopilotTurnContext()
+	storeResponseFunctionCallTurnContext(account.ID, []string{"call_1"}, ctx)
+
+	var gotReq *http.Request
+	withWorkerClient(t, &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		gotReq = req.Clone(req.Context())
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"id":"resp_next","output":[]}`)),
+		}, nil
+	})})
+
+	resp, _, turnRequest, err := DoResponsesProxy(account.ID, testState(), []byte(`{"model":"gpt-5.4","input":[{"type":"function_call_output","call_id":"call_1","output":"ok"}]}`))
+	if err != nil {
+		t.Fatalf("DoResponsesProxy returned error: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if gotReq == nil {
+		t.Fatal("expected worker request to be captured")
+	}
+	if gotReq.URL.Path != "/v1/responses" {
+		t.Fatalf("expected /v1/responses path, got %s", gotReq.URL.Path)
+	}
+	if turnRequest.Context != ctx {
+		t.Fatalf("expected stored context %+v, got %+v", ctx, turnRequest.Context)
+	}
+	assertHeaderValue(t, gotReq.Header, "X-Initiator", "agent")
+	assertHeaderValue(t, gotReq.Header, "X-Interaction-Type", copilotInteractionTypeAgent)
+	assertHeaderValue(t, gotReq.Header, "X-Interaction-Id", ctx.InteractionID)
+	assertHeaderValue(t, gotReq.Header, "X-Client-Session-Id", ctx.ClientSessionID)
+	assertHeaderValue(t, gotReq.Header, "X-Agent-Task-Id", ctx.AgentTaskID)
+	assertHeaderValue(t, gotReq.Header, "X-Client-Machine-Id", copilotClientMachineID)
 }
 
 func TestDoResponsesProxyPreservesParallelToolCalls(t *testing.T) {

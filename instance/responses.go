@@ -110,7 +110,7 @@ func doResponsesProxy(accountID string, state *config.State, bodyBytes []byte, m
 
 	if useWorker {
 		start := time.Now()
-		resp, err := ProxyRequestViaWorker(context.Background(), workerURL, "POST", "/v1/responses", bodyBytes, nil)
+		resp, err := ProxyRequestViaWorker(context.Background(), workerURL, "POST", "/v1/responses", bodyBytes, turnRequest.Headers())
 		statusCode := 0
 		if resp != nil {
 			statusCode = resp.StatusCode

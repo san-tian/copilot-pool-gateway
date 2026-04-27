@@ -66,10 +66,6 @@ func doOrphanTranslateResponsesProxy(accountID string, state *config.State, body
 	if acct, _ := store.GetAccount(accountID); acct != nil {
 		workerURL = strings.TrimSpace(acct.WorkerURL)
 	}
-	if workerURL != "" && reusableCopilotAgentTurnRequest(baseTurn) {
-		log.Printf("[responses account=%s] orphan_translate reusing turn context — bypassing worker bridge to preserve Copilot turn headers", accountID)
-		workerURL = ""
-	}
 	if workerURL == "" {
 		log.Printf("[responses account=%s] orphan_translate worker unavailable — falling back to direct upstream chat/completions", accountID)
 	}
@@ -111,7 +107,7 @@ func doOrphanTranslateResponsesProxy(accountID string, state *config.State, body
 		callMs int64
 	)
 	if workerURL != "" {
-		resp, err = ProxyRequestViaWorker(context.Background(), workerURL, "POST", "/v1/chat/completions", chatBody, nil)
+		resp, err = ProxyRequestViaWorker(context.Background(), workerURL, "POST", "/v1/chat/completions", chatBody, turnRequest.Headers())
 		callMs = time.Since(start).Milliseconds()
 		if err != nil {
 			log.Printf("[responses account=%s] orphan_translate worker call failed worker=%s worker_ms=%d: %v",
