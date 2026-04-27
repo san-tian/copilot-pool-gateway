@@ -1362,7 +1362,7 @@ func proxyResponses(c *gin.Context) {
 	// recovery records the explicit broken-continuation recovery route. Normal
 	// requests use ordinary pool routing; valid continuations use canonical
 	// sticky routing; only split/orphan/upstream-rejected continuations arm
-	// this state and switch to the stateless flatten route.
+	// this state and switch to the stateless transcript recovery route.
 	recovery := continuationRecoveryState{}
 	// pinnedAccount, when non-nil, forces the next iteration to reuse a known
 	// account without consulting sticky caches or the pool. Successful token
@@ -1438,8 +1438,7 @@ func proxyResponses(c *gin.Context) {
 	// those ids against the specific account+interaction that minted them:
 	// if we dispatch to a different account than the one that owns the
 	// history, upstream returns `input item does not belong to this
-	// connection` and our degrade fallback text-ifies the entire tool loop —
-	// which is what caused codex's write_stdin death loop. So we classify the
+	// connection`. So we classify the
 	// binding here, once, before the retry loop:
 	//   - Canonical (every hit agrees on one available account) → pin it for
 	//     every attempt. Cross-account rollover is disabled downstream by
@@ -1467,15 +1466,14 @@ func proxyResponses(c *gin.Context) {
 		case continuationBindingCanonical:
 			continuationPinned = binding.Resolved
 		case continuationBindingAccountUnavailable, continuationBindingSplit:
-			// Non-canonical but recoverable via orphan_translate flatten:
+			// Non-canonical but recoverable via orphan_translate transcript recovery:
 			// Split = history spans multiple accounts (common after a client-
 			// side compact that exposes cross-account call_ids); Unavailable
-			// = sole owner account is blocked/stopped. Because the flatten
-			// path drops all tool_call_ids (history → prose), neither case
-			// depends on any specific account owning the ids — we can clear
-			// continuation state and dispatch to an available account through
-			// the stateless recovery route. Falls back to the original typed error
-			// (409/503) when flatten isn't armable.
+			// = sole owner account is blocked/stopped. The recovery path
+			// removes account-owned protocol ids and wraps protocol history
+			// in a labeled context block, so neither case depends on any
+			// specific account owning the ids. Falls back to the original
+			// typed error (409/503) when recovery isn't armable.
 			recovery = resolveOrphanRecoveryState(c, requestedModel, exclude, binding.Reason, binding.AccountID)
 			if recovery.armed() && len(functionCallOutputIDs) > 0 {
 				recordResponsesRoutingEvent(responsesRoutingTelemetryEvent{
@@ -1504,7 +1502,7 @@ func proxyResponses(c *gin.Context) {
 			// self-contained, history is present in full), worker mode is
 			// available, and no degrade opt-in was requested, clear sticky
 			// state and route fresh. With RESPONSES_ORPHAN_TRANSLATE=on, the
-			// gateway uses the stateless flatten route; otherwise only
+			// gateway uses the stateless recovery route; otherwise only
 			// worker-enabled accounts are eligible for legacy passthrough.
 			//
 			// Skipped for prev_response_id-only orphans because that case's
@@ -1528,7 +1526,7 @@ func proxyResponses(c *gin.Context) {
 				functionCallOutputIDs = nil
 				continuationRequested = false
 				// When orphan-translate mode is armed, the invoke selection
-				// below picks a stateless flatten route instead of the
+				// below picks a stateless recovery route instead of the
 				// stateful /v1/responses upstream.
 				recovery = resolveOrphanRecoveryState(c, requestedModel, exclude, binding.Reason, "")
 				if recovery.armed() {
@@ -1683,7 +1681,7 @@ func proxyResponses(c *gin.Context) {
 		}
 		// Recovery routing overrides direct/detached mode only after the
 		// continuation state has been cleared. That keeps normal account
-		// binding separate from the stateless flatten retry.
+		// binding separate from the stateless transcript recovery retry.
 		if recovery.Route == orphanTranslateRouteChat {
 			invoke = instance.DoOrphanTranslateResponsesProxy
 			modeName = recovery.Route.modeName()
@@ -1774,10 +1772,11 @@ func proxyResponses(c *gin.Context) {
 			// Canonical binding said "this account owns the history" but
 			// upstream disagreed (session state was evicted / rotated).
 			// Treat this as a late orphan and fall through to the orphan
-			// translate path, which flattens tool history and dispatches
-			// to the worker's stateless endpoint. Unlike the opt-in
+			// translate path, which wraps protocol history in a labeled
+			// context block and dispatches to the worker's stateless endpoint.
+			// Unlike the opt-in
 			// degrade above, this does NOT require the degrade header —
-			// the translator is the canonical flatten-and-retry mechanism
+			// the translator is the canonical transcript recovery mechanism
 			// and already runs on orphan-bound traffic today. Guarded by
 			// orphanDegraded and recovery.armed() so a single request does
 			// not keep re-arming the same recovery route.

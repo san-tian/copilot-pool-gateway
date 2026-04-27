@@ -24,13 +24,15 @@ import (
 // and Anthropic has no equivalent inline reasoning carrier.
 // Non-function tools (web_search, image_generation, custom types) are dropped.
 //
-// Prior reasoning and tool history is dropped instead of flattened into
-// ordinary prose. If the original Responses structure cannot be replayed on
-// the bound connection, prose markers such as "[Tool call: ...]" pollute the
-// next model turn and can make the model emit tool/thinking protocol as user
-// visible text. Automatic recovery therefore restarts from the latest real
-// user message plus top-level instructions. The explicit
-// X-Copilot-Continuation-Degrade opt-in still owns lossy prose degradation.
+// Reasoning and tool protocol history is converted into an explicit
+// ToolCallHistory block instead of being flattened as ordinary prose. If the
+// original Responses structure cannot be replayed on the bound connection,
+// unlabeled prose markers such as "[Tool call: ...]" pollute the next model
+// turn and can make the model emit tool/thinking protocol as user visible
+// text. Automatic recovery therefore preserves ordinary role-bearing message
+// transcript plus a clearly-labeled historical context block. The explicit
+// X-Copilot-Continuation-Degrade opt-in still owns legacy lossy prose
+// degradation.
 func ResponsesToMessages(bodyBytes []byte) ([]byte, TranslateStats, error) {
 	var src map[string]interface{}
 	if err := json.Unmarshal(bodyBytes, &src); err != nil {
@@ -101,15 +103,15 @@ func ResponsesToMessages(bodyBytes []byte) ([]byte, TranslateStats, error) {
 }
 
 // translateResponsesInputToAnthropic walks Responses input[] and emits an
-// Anthropic messages[] array for automatic recovery. It keeps only the latest
-// real user message and drops reasoning/function-call history so protocol
-// artifacts do not become natural-language context.
+// Anthropic messages[] array for automatic recovery. It keeps ordinary
+// role-bearing messages and converts reasoning/function-call history into a
+// labeled context block so protocol artifacts do not look like live protocol.
 func translateResponsesInputToAnthropic(raw interface{}, stats *TranslateStats) []interface{} {
 	input := normalizeInput(raw)
 	stats.InputItems = len(input)
 
 	flat := newFlatBuilder()
-	var lastUser map[string]interface{}
+	history := newProtocolHistoryBuilder()
 
 	for _, item := range input {
 		itemMap, ok := item.(map[string]interface{})
@@ -122,32 +124,31 @@ func translateResponsesInputToAnthropic(raw interface{}, stats *TranslateStats) 
 		switch {
 		case itemType == "reasoning":
 			stats.DroppedReasoning++
+			history.addReasoning(itemMap)
 			continue
 
 		case itemType == "function_call":
+			history.addToolCall(itemMap)
 			continue
 
 		case itemType == "function_call_output":
+			history.addToolResult(itemMap)
 			continue
 
 		case itemType == "message" || (itemType == "" && role != ""):
-			if role == "user" {
-				if msg := translateMessageForAnthropic(itemMap); msg != nil {
-					lastUser = msg
-				}
+			if msg := translateMessageForAnthropic(itemMap); msg != nil {
+				flat.appendRealMessage(msg)
 			}
 
 		default:
-			if role == "user" {
+			if role != "" {
 				if msg := translateMessageForAnthropic(itemMap); msg != nil {
-					lastUser = msg
+					flat.appendRealMessage(msg)
 				}
 			}
 		}
 	}
-	if lastUser != nil {
-		flat.appendRealMessage(lastUser)
-	}
+	flat.appendRecoveryHistory(history.render())
 
 	return flat.finalize()
 }

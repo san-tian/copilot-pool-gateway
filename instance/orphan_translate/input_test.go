@@ -28,6 +28,27 @@ func mustTranslate(t *testing.T, body map[string]interface{}) (map[string]interf
 	return parsed, stats
 }
 
+func assertHistoryBlock(t *testing.T, msg interface{}, wants ...string) string {
+	t.Helper()
+	mapped := msg.(map[string]interface{})
+	if mapped["role"] != "user" {
+		t.Fatalf("history block must be user context, got %+v", mapped)
+	}
+	content, ok := mapped["content"].(string)
+	if !ok {
+		t.Fatalf("history block content should be string, got %T", mapped["content"])
+	}
+	for _, want := range append([]string{"<ToolCallHistory>", "<Description>", "</Description>"}, wants...) {
+		if !strings.Contains(content, want) {
+			t.Fatalf("history block missing %q: %s", want, content)
+		}
+	}
+	if strings.Contains(content, "[Tool call") || strings.Contains(content, "[Previous tool call") {
+		t.Fatalf("history block must use structured tags instead of legacy prose markers: %s", content)
+	}
+	return content
+}
+
 func TestResponsesToChat_InstructionsBecomeSystem(t *testing.T) {
 	body := map[string]interface{}{
 		"model":        "gpt-5",
@@ -69,16 +90,28 @@ func TestResponsesToChat_ToolHistoryDroppedAfterRealAssistant(t *testing.T) {
 	}
 	chat, _ := mustTranslate(t, body)
 	msgs := chat["messages"].([]interface{})
-	if len(msgs) != 1 {
-		t.Fatalf("want latest user message only, got %d: %+v", len(msgs), msgs)
+	if len(msgs) != 4 {
+		t.Fatalf("want ordinary transcript plus continue, got %d: %+v", len(msgs), msgs)
 	}
 
 	user := msgs[0].(map[string]interface{})
 	if user["role"] != "user" || user["content"] != "list files" {
-		t.Fatalf("should restart from real user message, got %+v", user)
+		t.Fatalf("should keep prior real user message, got %+v", user)
 	}
-	if strings.Contains(user["content"].(string), "Tool call") || strings.Contains(user["content"].(string), "returned") {
-		t.Fatalf("tool history must not leak into user content: %q", user["content"])
+	assistant := msgs[1].(map[string]interface{})
+	if assistant["role"] != "assistant" || assistant["content"] != "Sure." {
+		t.Fatalf("should keep ordinary assistant message, got %+v", assistant)
+	}
+	assertHistoryBlock(t, msgs[2], "<Tool>", "<Name>Read</Name>", "<Arguments>{&#34;p&#34;:&#34;a&#34;}</Arguments>", "<Result>content</Result>")
+	tail := msgs[3].(map[string]interface{})
+	if tail["role"] != "user" || tail["content"] != "continue" {
+		t.Fatalf("should append continue after assistant tail, got %+v", tail)
+	}
+	for _, msg := range msgs[:2] {
+		content, _ := msg.(map[string]interface{})["content"].(string)
+		if strings.Contains(content, "Tool call") || strings.Contains(content, "returned") || strings.Contains(content, "content") {
+			t.Fatalf("tool history must not leak into message content: %+v", msg)
+		}
 	}
 }
 
@@ -93,12 +126,39 @@ func TestResponsesToChat_FunctionCallWithoutPriorAssistantDropped(t *testing.T) 
 	}
 	chat, _ := mustTranslate(t, body)
 	msgs := chat["messages"].([]interface{})
-	if len(msgs) != 1 {
-		t.Fatalf("want latest user message only, got %d: %+v", len(msgs), msgs)
+	if len(msgs) != 3 {
+		t.Fatalf("want real user message only, got %d: %+v", len(msgs), msgs)
 	}
 	user := msgs[0].(map[string]interface{})
 	if user["role"] != "user" || user["content"] != "x" {
-		t.Fatalf("should restart from real user message, got %+v", user)
+		t.Fatalf("should keep real user message, got %+v", user)
+	}
+	assertHistoryBlock(t, msgs[1], "<Name>N</Name>", "<Arguments>{}</Arguments>", "<Result>ok</Result>")
+	tail := msgs[2].(map[string]interface{})
+	if tail["role"] != "user" || tail["content"] != "continue" {
+		t.Fatalf("should append continue after history block, got %+v", tail)
+	}
+}
+
+func TestResponsesToChat_PreservesOrdinaryTranscript(t *testing.T) {
+	body := map[string]interface{}{
+		"model": "gpt-5",
+		"input": []interface{}{
+			map[string]interface{}{"type": "message", "role": "user", "content": "remember alpha"},
+			map[string]interface{}{"type": "message", "role": "assistant", "content": "alpha remembered"},
+			map[string]interface{}{"type": "message", "role": "user", "content": "what did I ask you to remember?"},
+		},
+	}
+	chat, _ := mustTranslate(t, body)
+	msgs := chat["messages"].([]interface{})
+	if len(msgs) != 3 {
+		t.Fatalf("want full ordinary transcript, got %d: %+v", len(msgs), msgs)
+	}
+	for i, want := range []string{"remember alpha", "alpha remembered", "what did I ask you to remember?"} {
+		got := msgs[i].(map[string]interface{})["content"]
+		if got != want {
+			t.Fatalf("message %d content want %q got %+v", i, want, got)
+		}
 	}
 }
 
@@ -116,12 +176,21 @@ func TestResponsesToChat_MultipleFunctionCallsDropped(t *testing.T) {
 	}
 	chat, _ := mustTranslate(t, body)
 	msgs := chat["messages"].([]interface{})
-	if len(msgs) != 1 {
-		t.Fatalf("want latest user message only, got %d: %+v", len(msgs), msgs)
+	if len(msgs) != 4 {
+		t.Fatalf("want ordinary transcript plus continue, got %d: %+v", len(msgs), msgs)
 	}
 	user := msgs[0].(map[string]interface{})
 	if user["role"] != "user" || user["content"] != "do two things" {
-		t.Fatalf("should restart from real user message, got %+v", user)
+		t.Fatalf("should keep real user message, got %+v", user)
+	}
+	assistant := msgs[1].(map[string]interface{})
+	if assistant["role"] != "assistant" || assistant["content"] != "ok" {
+		t.Fatalf("should keep ordinary assistant message, got %+v", assistant)
+	}
+	assertHistoryBlock(t, msgs[2], "<CallID>fc_1</CallID>", "<CallID>fc_2</CallID>", "<Result>a</Result>", "<Result>b</Result>")
+	tail := msgs[3].(map[string]interface{})
+	if tail["role"] != "user" || tail["content"] != "continue" {
+		t.Fatalf("should append continue after dropped tool tail, got %+v", tail)
 	}
 }
 
@@ -141,12 +210,21 @@ func TestResponsesToChat_ReasoningDropped(t *testing.T) {
 		t.Fatalf("dropped reasoning want 2 got %d", stats.DroppedReasoning)
 	}
 	msgs := chat["messages"].([]interface{})
-	if len(msgs) != 1 {
-		t.Fatalf("recovery should keep latest user only, got %d messages: %+v", len(msgs), msgs)
+	if len(msgs) != 5 {
+		t.Fatalf("recovery should keep ordinary messages, got %d messages: %+v", len(msgs), msgs)
 	}
-	only := msgs[0].(map[string]interface{})
-	if only["role"] != "user" || only["content"] != "and again" {
-		t.Fatalf("latest user message wrong: %+v", only)
+	if msgs[0].(map[string]interface{})["content"] != "hi" {
+		t.Fatalf("first user message wrong: %+v", msgs[0])
+	}
+	if msgs[1].(map[string]interface{})["role"] != "assistant" || msgs[1].(map[string]interface{})["content"] != "hello" {
+		t.Fatalf("assistant message wrong: %+v", msgs[1])
+	}
+	if msgs[2].(map[string]interface{})["content"] != "and again" {
+		t.Fatalf("tail user message wrong: %+v", msgs[2])
+	}
+	assertHistoryBlock(t, msgs[3], "<Reasoning>", "Encrypted reasoning was present", "<Summary>thought</Summary>")
+	if msgs[4].(map[string]interface{})["content"] != "continue" {
+		t.Fatalf("history block should be followed by continue, got %+v", msgs[4])
 	}
 }
 
@@ -307,16 +385,20 @@ func TestResponsesToChat_FunctionCallOutputNonString(t *testing.T) {
 	}
 	chat, _ := mustTranslate(t, body)
 	msgs := chat["messages"].([]interface{})
-	tail := msgs[len(msgs)-1].(map[string]interface{})
-	if tail["role"] != "user" {
-		t.Fatalf("tail should be user, got %+v", tail)
+	if len(msgs) != 3 {
+		t.Fatalf("want user, history, continue messages, got %d: %+v", len(msgs), msgs)
 	}
-	content := tail["content"].(string)
-	if content != "x" {
-		t.Fatalf("tool output must be dropped, got: %q", content)
+	user := msgs[0].(map[string]interface{})
+	if user["role"] != "user" || user["content"] != "x" {
+		t.Fatalf("should keep real user message, got %+v", user)
 	}
-	if strings.Contains(content, `"result"`) || strings.Contains(content, "Tool") {
-		t.Fatalf("tool output leaked into user content: %q", content)
+	history := assertHistoryBlock(t, msgs[1], "<Result>{&#34;code&#34;:0,&#34;result&#34;:&#34;ok&#34;}</Result>")
+	if strings.Contains(history, "[Previous tool call") {
+		t.Fatalf("tool output leaked as legacy prose: %q", history)
+	}
+	tail := msgs[2].(map[string]interface{})
+	if tail["role"] != "user" || tail["content"] != "continue" {
+		t.Fatalf("should append continue after history block, got %+v", tail)
 	}
 }
 
@@ -333,13 +415,13 @@ func TestResponsesToChat_TailFunctionCallOutputDroppedWhenUserExists(t *testing.
 	}
 	chat, _ := mustTranslate(t, body)
 	msgs := chat["messages"].([]interface{})
-	tail := msgs[len(msgs)-1].(map[string]interface{})
-	if tail["role"] != "user" {
-		t.Fatalf("tail must be user role, got %+v", tail)
+	if len(msgs) != 3 {
+		t.Fatalf("want user, history, continue messages, got %d: %+v", len(msgs), msgs)
 	}
-	content := tail["content"].(string)
-	if content != "x" {
-		t.Fatalf("should restart from latest user and drop tool output, got: %q", content)
+	assertHistoryBlock(t, msgs[1], "<Name>N</Name>", "<Arguments>{}</Arguments>", "<Result>done</Result>")
+	tail := msgs[2].(map[string]interface{})
+	if tail["role"] != "user" || tail["content"] != "continue" {
+		t.Fatalf("tail must be continue user role, got %+v", tail)
 	}
 }
 
@@ -379,12 +461,16 @@ func TestResponsesToChat_DanglingFunctionCallAppendsUserTurn(t *testing.T) {
 	}
 	chat, _ := mustTranslate(t, body)
 	msgs := chat["messages"].([]interface{})
-	if len(msgs) != 1 {
-		t.Fatalf("want latest user message only, got %d: %+v", len(msgs), msgs)
+	if len(msgs) != 3 {
+		t.Fatalf("want real user message only, got %d: %+v", len(msgs), msgs)
 	}
 	tail := msgs[0].(map[string]interface{})
 	if tail["role"] != "user" || tail["content"] != "x" {
 		t.Fatalf("tail should be original user turn, got %+v", tail)
+	}
+	assertHistoryBlock(t, msgs[1], "<Name>N</Name>", "<Arguments>{}</Arguments>")
+	if msgs[2].(map[string]interface{})["content"] != "continue" {
+		t.Fatalf("history block should be followed by continue, got %+v", msgs[2])
 	}
 }
 
