@@ -21,6 +21,8 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+type responsesInvokeFunc func(accountID string, state *config.State, bodyBytes []byte) (*http.Response, []byte, instance.CopilotTurnRequest, error)
+
 func newRequestID() string {
 	var b [6]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -1454,6 +1456,8 @@ func proxyResponses(c *gin.Context) {
 	//     X-Copilot-Continuation-Degrade: orphan, in which case we degrade
 	//     the fc history into text and fall through to first-turn routing.
 	var continuationPinned *resolvedAccount
+	var replayInvalidRecoveryTurn instance.CopilotTurnRequest
+	replayInvalidRecoveryTurnSet := false
 	// degradeOptIn is computed once and consulted in two places: the pre-loop
 	// orphan-from-cache branch (directly below) and the in-loop
 	// replay-invalid-from-upstream branch further down. Both must agree so
@@ -1677,7 +1681,7 @@ func proxyResponses(c *gin.Context) {
 		if continuationPinned != nil {
 			continuationCanDetach = false
 		}
-		invoke := instance.DoResponsesProxy
+		var invoke responsesInvokeFunc = instance.DoResponsesProxy
 		modeName := "direct"
 		if continuationRequested {
 			switch {
@@ -1693,11 +1697,25 @@ func proxyResponses(c *gin.Context) {
 		// continuation state has been cleared. That keeps normal account
 		// binding separate from the stateless transcript recovery retry.
 		if recovery.Route == orphanTranslateRouteChat {
-			invoke = instance.DoOrphanTranslateResponsesProxy
+			if replayInvalidRecoveryTurnSet {
+				baseTurn := replayInvalidRecoveryTurn
+				invoke = func(accountID string, state *config.State, bodyBytes []byte) (*http.Response, []byte, instance.CopilotTurnRequest, error) {
+					return instance.DoOrphanTranslateResponsesProxyWithTurn(accountID, state, bodyBytes, baseTurn)
+				}
+			} else {
+				invoke = instance.DoOrphanTranslateResponsesProxy
+			}
 			modeName = recovery.Route.modeName()
 		}
 		if recovery.Route == orphanTranslateRouteMessages {
-			invoke = instance.DoOrphanTranslateMessagesProxy
+			if replayInvalidRecoveryTurnSet {
+				baseTurn := replayInvalidRecoveryTurn
+				invoke = func(accountID string, state *config.State, bodyBytes []byte) (*http.Response, []byte, instance.CopilotTurnRequest, error) {
+					return instance.DoOrphanTranslateMessagesProxyWithTurn(accountID, state, bodyBytes, baseTurn)
+				}
+			} else {
+				invoke = instance.DoOrphanTranslateMessagesProxy
+			}
 			modeName = recovery.Route.modeName()
 		}
 		log.Printf("[responses rid=%s attempt=%d] mode=%s can_detach=%v account=%s",
@@ -1818,6 +1836,8 @@ func proxyResponses(c *gin.Context) {
 					continuationRequested = false
 					continuationPinned = nil
 					crossAccountRollover = false
+					replayInvalidRecoveryTurn = turnRequest
+					replayInvalidRecoveryTurnSet = true
 					pinnedAccount = resolved
 					pinnedAccountKind = "recovery_same_account"
 					log.Printf("[responses rid=%s attempt=%d] recovery armed after replay-invalid recovery_from_account=%q recovery_to_account=%q recovery_route=%s previous_mode=%s detail=%q",

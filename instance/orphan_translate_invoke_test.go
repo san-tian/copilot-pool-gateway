@@ -146,6 +146,62 @@ func TestDoOrphanTranslateResponsesProxyDirectFallbackWrapsStreamingSuccess(t *t
 	}
 }
 
+func TestDoOrphanTranslateResponsesProxyWithTurnReusesAgentHeaders(t *testing.T) {
+	setupOrphanInvokeTestEnv(t)
+
+	account, err := store.AddAccount("demo", "gh-token", "individual")
+	if err != nil {
+		t.Fatalf("AddAccount: %v", err)
+	}
+
+	baseTurn := copilotTurnRequest{
+		Context: copilotTurnContext{
+			InteractionID:   "interaction-1",
+			ClientSessionID: "client-session-1",
+			AgentTaskID:     "agent-task-1",
+		},
+		InteractionType: copilotInteractionTypeAgent,
+		Initiator:       "agent",
+		CacheSource:     "fc_output_id_hit",
+	}
+
+	withStreamingClient(t, &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			assertHeaderValue(t, req.Header, "X-Interaction-Type", copilotInteractionTypeAgent)
+			assertHeaderValue(t, req.Header, "X-Initiator", "agent")
+			assertHeaderValue(t, req.Header, "X-Interaction-Id", "interaction-1")
+			assertHeaderValue(t, req.Header, "X-Client-Session-Id", "client-session-1")
+			assertHeaderValue(t, req.Header, "X-Agent-Task-Id", "agent-task-1")
+			return &http.Response{
+				StatusCode: http.StatusTeapot,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"error":"teapot"}`)),
+			}, nil
+		}),
+	})
+
+	resp, _, turnRequest, err := DoOrphanTranslateResponsesProxyWithTurn(account.ID, &config.State{
+		CopilotToken:  "copilot-token",
+		VSCodeVersion: "1.99.0",
+		AccountType:   "individual",
+	}, []byte(`{"model":"gpt-4o-mini","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}`), baseTurn)
+	if err != nil {
+		t.Fatalf("DoOrphanTranslateResponsesProxyWithTurn returned error: %v", err)
+	}
+	if resp == nil {
+		t.Fatalf("expected response, got nil")
+	}
+	if turnRequest.CacheSource != "orphan_translate_reuse_turn" {
+		t.Fatalf("CacheSource = %q", turnRequest.CacheSource)
+	}
+	if turnRequest.Context != baseTurn.Context {
+		t.Fatalf("expected reused context %+v, got %+v", baseTurn.Context, turnRequest.Context)
+	}
+	if turnRequest.InteractionType != copilotInteractionTypeAgent {
+		t.Fatalf("InteractionType = %q", turnRequest.InteractionType)
+	}
+}
+
 func TestDoOrphanTranslateMessagesProxyFallsBackWithoutWorkerURL(t *testing.T) {
 	setupOrphanInvokeTestEnv(t)
 
@@ -260,6 +316,62 @@ func TestDoOrphanTranslateMessagesProxyDirectFallbackWrapsStreamingSuccess(t *te
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected wrapped responses stream to contain %q, got:\n%s", want, body)
 		}
+	}
+}
+
+func TestDoOrphanTranslateMessagesProxyWithTurnReusesAgentHeaders(t *testing.T) {
+	setupOrphanInvokeTestEnv(t)
+
+	account, err := store.AddAccount("demo", "gh-token", "individual")
+	if err != nil {
+		t.Fatalf("AddAccount: %v", err)
+	}
+
+	baseTurn := copilotTurnRequest{
+		Context: copilotTurnContext{
+			InteractionID:   "interaction-2",
+			ClientSessionID: "client-session-2",
+			AgentTaskID:     "agent-task-2",
+		},
+		InteractionType: copilotInteractionTypeAgent,
+		Initiator:       "agent",
+		CacheSource:     "fc_output_id_hit",
+	}
+
+	withStreamingClient(t, &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			assertHeaderValue(t, req.Header, "X-Interaction-Type", copilotInteractionTypeAgent)
+			assertHeaderValue(t, req.Header, "X-Initiator", "agent")
+			assertHeaderValue(t, req.Header, "X-Interaction-Id", "interaction-2")
+			assertHeaderValue(t, req.Header, "X-Client-Session-Id", "client-session-2")
+			assertHeaderValue(t, req.Header, "X-Agent-Task-Id", "agent-task-2")
+			return &http.Response{
+				StatusCode: http.StatusTeapot,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"error":"teapot"}`)),
+			}, nil
+		}),
+	})
+
+	resp, _, turnRequest, err := DoOrphanTranslateMessagesProxyWithTurn(account.ID, &config.State{
+		CopilotToken:  "copilot-token",
+		VSCodeVersion: "1.99.0",
+		AccountType:   "individual",
+	}, []byte(`{"model":"gpt-5.4","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}`), baseTurn)
+	if err != nil {
+		t.Fatalf("DoOrphanTranslateMessagesProxyWithTurn returned error: %v", err)
+	}
+	if resp == nil {
+		t.Fatalf("expected response, got nil")
+	}
+	if turnRequest.CacheSource != "orphan_translate_messages_reuse_turn" {
+		t.Fatalf("CacheSource = %q", turnRequest.CacheSource)
+	}
+	if turnRequest.Context != baseTurn.Context {
+		t.Fatalf("expected reused context %+v, got %+v", baseTurn.Context, turnRequest.Context)
+	}
+	if turnRequest.InteractionType != copilotInteractionTypeAgent {
+		t.Fatalf("InteractionType = %q", turnRequest.InteractionType)
 	}
 }
 

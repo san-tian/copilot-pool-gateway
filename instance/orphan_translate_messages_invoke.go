@@ -43,8 +43,15 @@ import (
 // handler/proxy.go routes by model family (gpt-5*/claude-* → messages path,
 // else chat path).
 func DoOrphanTranslateMessagesProxy(accountID string, state *config.State, bodyBytes []byte) (*http.Response, []byte, copilotTurnRequest, error) {
-	turnRequest := newCopilotTurnRequest(copilotInteractionTypeUser)
-	turnRequest.CacheSource = "orphan_translate_messages_fresh"
+	return doOrphanTranslateMessagesProxy(accountID, state, bodyBytes, copilotTurnRequest{})
+}
+
+func DoOrphanTranslateMessagesProxyWithTurn(accountID string, state *config.State, bodyBytes []byte, baseTurn CopilotTurnRequest) (*http.Response, []byte, copilotTurnRequest, error) {
+	return doOrphanTranslateMessagesProxy(accountID, state, bodyBytes, baseTurn)
+}
+
+func doOrphanTranslateMessagesProxy(accountID string, state *config.State, bodyBytes []byte, baseTurn copilotTurnRequest) (*http.Response, []byte, copilotTurnRequest, error) {
+	turnRequest := recoveryCopilotTurnRequest(baseTurn, "orphan_translate_messages_fresh", "orphan_translate_messages_reuse_turn")
 
 	workerURL := ""
 	if acct, _ := store.GetAccount(accountID); acct != nil {

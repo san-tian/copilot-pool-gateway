@@ -35,6 +35,8 @@ type copilotTurnRequest struct {
 	CacheSource     string
 }
 
+type CopilotTurnRequest = copilotTurnRequest
+
 type copilotTurnCacheEntry struct {
 	AccountID  string
 	Context    copilotTurnContext
@@ -81,6 +83,23 @@ func newCopilotTurnRequest(interactionType string) copilotTurnRequest {
 		InteractionType: interactionType,
 		Initiator:       initiator,
 	}
+}
+
+func reusableCopilotAgentTurnRequest(req copilotTurnRequest) bool {
+	return req.InteractionType == copilotInteractionTypeAgent &&
+		req.Context.InteractionID != "" &&
+		req.Context.ClientSessionID != "" &&
+		req.Context.AgentTaskID != ""
+}
+
+func recoveryCopilotTurnRequest(base copilotTurnRequest, freshSource string, reuseSource string) copilotTurnRequest {
+	if reusableCopilotAgentTurnRequest(base) {
+		base.CacheSource = reuseSource
+		return base
+	}
+	req := newCopilotTurnRequest(copilotInteractionTypeUser)
+	req.CacheSource = freshSource
+	return req
 }
 
 func (r copilotTurnRequest) Headers() http.Header {

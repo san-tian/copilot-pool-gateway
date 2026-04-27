@@ -52,8 +52,15 @@ func mergeHeaderSets(base, extra http.Header) http.Header {
 // When the resolved account has no WorkerURL, the gateway falls back to a
 // direct upstream /chat/completions proxy using the translated payload.
 func DoOrphanTranslateResponsesProxy(accountID string, state *config.State, bodyBytes []byte) (*http.Response, []byte, copilotTurnRequest, error) {
-	turnRequest := newCopilotTurnRequest(copilotInteractionTypeUser)
-	turnRequest.CacheSource = "orphan_translate_fresh"
+	return doOrphanTranslateResponsesProxy(accountID, state, bodyBytes, copilotTurnRequest{})
+}
+
+func DoOrphanTranslateResponsesProxyWithTurn(accountID string, state *config.State, bodyBytes []byte, baseTurn CopilotTurnRequest) (*http.Response, []byte, copilotTurnRequest, error) {
+	return doOrphanTranslateResponsesProxy(accountID, state, bodyBytes, baseTurn)
+}
+
+func doOrphanTranslateResponsesProxy(accountID string, state *config.State, bodyBytes []byte, baseTurn copilotTurnRequest) (*http.Response, []byte, copilotTurnRequest, error) {
+	turnRequest := recoveryCopilotTurnRequest(baseTurn, "orphan_translate_fresh", "orphan_translate_reuse_turn")
 
 	workerURL := ""
 	if acct, _ := store.GetAccount(accountID); acct != nil {
@@ -115,7 +122,7 @@ func DoOrphanTranslateResponsesProxy(accountID string, state *config.State, body
 			log.Printf("[responses account=%s] orphan_translate direct normalization failed: %v", accountID, normErr)
 			return nil, bodyBytes, turnRequest, normErr
 		}
-		resp, err = ProxyRequestWithBytes(state, "POST", "/chat/completions", normalizedBody, mergeHeaderSets(turnRequest.Headers(), extraHeaders), hasVision)
+		resp, err = ProxyRequestWithBytes(state, "POST", "/chat/completions", normalizedBody, mergeHeaderSets(extraHeaders, turnRequest.Headers()), hasVision)
 		callMs = time.Since(start).Milliseconds()
 		if err != nil {
 			log.Printf("[responses account=%s] orphan_translate direct call failed direct_ms=%d: %v",
