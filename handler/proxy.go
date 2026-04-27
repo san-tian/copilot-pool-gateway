@@ -484,6 +484,14 @@ func resolveStateForMessageReplay(toolResultIDs []string, requestedModel string)
 	if !ok {
 		return nil
 	}
+	return resolveKnownAccount(accountID, requestedModel)
+}
+
+func resolveKnownAccount(accountID string, requestedModel string) *resolvedAccount {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return nil
+	}
 	if store.IsModelBlocked(accountID, requestedModel) {
 		return nil
 	}
@@ -499,14 +507,14 @@ func resolveStateForResponseFunctionCallReplay(callIDs []string, requestedModel 
 	if !ok {
 		return nil
 	}
-	if store.IsModelBlocked(accountID, requestedModel) {
-		return nil
+	return resolveKnownAccount(accountID, requestedModel)
+}
+
+func shouldRetryMessagesDetachedSameAccount(continuationRequested bool, resolved *resolvedAccount, replayBound bool, detachedMode bool, attempt int, maxAttempts int) string {
+	if !continuationRequested || resolved == nil || !replayBound || detachedMode || attempt >= maxAttempts-1 {
+		return ""
 	}
-	state := instance.GetInstanceState(accountID)
-	if state == nil {
-		return nil
-	}
-	return &resolvedAccount{State: state, AccountID: accountID}
+	return strings.TrimSpace(resolved.AccountID)
 }
 
 func resolveState(c *gin.Context, exclude map[string]bool, requestedModel string) *resolvedAccount {
@@ -1008,12 +1016,27 @@ func proxyMessages(c *gin.Context) {
 		reqID, traceID, requestedModel, continuationRequested, toolResultIDs, isPool == true, len(bodyBytes))
 	exclude := make(map[string]bool)
 	crossAccountRollover := false
+	sameAccountDetachedRetryAccountID := ""
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		var resolved *resolvedAccount
 		replayBound := false
+		if sameAccountDetachedRetryAccountID != "" {
+			resolved = resolveKnownAccount(sameAccountDetachedRetryAccountID, requestedModel)
+			if resolved == nil {
+				if isPool == true {
+					exclude[sameAccountDetachedRetryAccountID] = true
+					crossAccountRollover = true
+				}
+				log.Printf("[messages rid=%s trace=%s attempt=%d] same-account detached retry account=%s no longer available",
+					reqID, traceID, attempt, sameAccountDetachedRetryAccountID)
+				sameAccountDetachedRetryAccountID = ""
+			}
+		}
 		if continuationRequested && !crossAccountRollover {
-			resolved = resolveStateForMessageReplay(toolResultIDs, requestedModel)
-			replayBound = resolved != nil
+			if resolved == nil {
+				resolved = resolveStateForMessageReplay(toolResultIDs, requestedModel)
+				replayBound = resolved != nil
+			}
 		}
 		if resolved == nil {
 			if affinityKey, ok := c.Get("messagesSessionAffinityKey"); ok {
@@ -1039,7 +1062,7 @@ func proxyMessages(c *gin.Context) {
 		instance.RecordRequest(resolved.AccountID, false, false)
 
 		invoke := instance.DoMessagesProxy
-		detachedMode := continuationRequested && !replayBound
+		detachedMode := continuationRequested && (sameAccountDetachedRetryAccountID != "" || !replayBound)
 		if detachedMode {
 			invoke = instance.DoDetachedMessagesProxy
 		}
@@ -1055,7 +1078,14 @@ func proxyMessages(c *gin.Context) {
 				return
 			}
 			if attempt < maxAttempts-1 {
+				if retryAccountID := shouldRetryMessagesDetachedSameAccount(continuationRequested, resolved, replayBound, detachedMode, attempt, maxAttempts); retryAccountID != "" {
+					sameAccountDetachedRetryAccountID = retryAccountID
+					log.Printf("[messages rid=%s trace=%s attempt=%d] canonical continuation proxy error account=%s retrying detached on same account: %v",
+						reqID, traceID, attempt, resolved.AccountID, proxyErr)
+					continue
+				}
 				if continuationRequested && isPool == true {
+					sameAccountDetachedRetryAccountID = ""
 					exclude[resolved.AccountID] = true
 					crossAccountRollover = true
 					log.Printf("[messages rid=%s trace=%s attempt=%d] detached continuation failed account=%s retrying: %v",
@@ -1077,7 +1107,14 @@ func proxyMessages(c *gin.Context) {
 			if replayInvalid, detail := readReplayInvalidResponse(resp); replayInvalid {
 				instance.RecordRequest(resolved.AccountID, true, false)
 				_ = resp.Body.Close()
+				if retryAccountID := shouldRetryMessagesDetachedSameAccount(continuationRequested, resolved, replayBound, detachedMode, attempt, maxAttempts); retryAccountID != "" {
+					sameAccountDetachedRetryAccountID = retryAccountID
+					log.Printf("[messages rid=%s trace=%s attempt=%d] canonical continuation replay-invalid account=%s retrying detached on same account: %s",
+						reqID, traceID, attempt, resolved.AccountID, detail)
+					continue
+				}
 				if attempt < maxAttempts-1 && isPool == true {
+					sameAccountDetachedRetryAccountID = ""
 					exclude[resolved.AccountID] = true
 					crossAccountRollover = true
 					log.Printf("[messages rid=%s trace=%s attempt=%d] continuation replay-invalid account=%s replay_bound=%v detached=%v retrying: %s",
@@ -1094,6 +1131,7 @@ func proxyMessages(c *gin.Context) {
 			if attempt < maxAttempts-1 {
 				_ = resp.Body.Close()
 				if continuationRequested && isPool == true {
+					sameAccountDetachedRetryAccountID = ""
 					exclude[resolved.AccountID] = true
 					crossAccountRollover = true
 					log.Printf("[messages rid=%s trace=%s attempt=%d] disabled account=%s detached continuation reason=%q retrying",
@@ -1113,7 +1151,14 @@ func proxyMessages(c *gin.Context) {
 			is429 := resp.StatusCode == http.StatusTooManyRequests
 			instance.RecordRequest(resolved.AccountID, true, is429)
 			_ = resp.Body.Close()
+			if retryAccountID := shouldRetryMessagesDetachedSameAccount(continuationRequested, resolved, replayBound, detachedMode, attempt, maxAttempts); retryAccountID != "" {
+				sameAccountDetachedRetryAccountID = retryAccountID
+				log.Printf("[messages rid=%s trace=%s attempt=%d] canonical continuation upstream_status=%d account=%s retrying detached on same account",
+					reqID, traceID, attempt, resp.StatusCode, resolved.AccountID)
+				continue
+			}
 			if continuationRequested && isPool == true {
+				sameAccountDetachedRetryAccountID = ""
 				exclude[resolved.AccountID] = true
 				crossAccountRollover = true
 				log.Printf("[messages rid=%s trace=%s attempt=%d] continuation upstream_status=%d account=%s replay_bound=%v detached=%v retrying",

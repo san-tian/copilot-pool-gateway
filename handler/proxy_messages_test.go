@@ -85,3 +85,23 @@ func TestSetMessagesSessionAffinityContextPoolOnly(t *testing.T) {
 		t.Fatalf("source = %v, want metadata.user_id.session_id", source)
 	}
 }
+
+func TestShouldRetryMessagesDetachedSameAccount(t *testing.T) {
+	resolved := &resolvedAccount{AccountID: "acct-1"}
+
+	if got := shouldRetryMessagesDetachedSameAccount(true, resolved, true, false, 0, 3); got != "acct-1" {
+		t.Fatalf("same-account detached retry = %q, want acct-1", got)
+	}
+	if got := shouldRetryMessagesDetachedSameAccount(true, resolved, true, true, 1, 3); got != "" {
+		t.Fatalf("detached follow-up must not re-arm same-account retry, got %q", got)
+	}
+	if got := shouldRetryMessagesDetachedSameAccount(true, resolved, false, false, 0, 3); got != "" {
+		t.Fatalf("non-canonical continuation must not arm same-account detached retry, got %q", got)
+	}
+	if got := shouldRetryMessagesDetachedSameAccount(false, resolved, true, false, 0, 3); got != "" {
+		t.Fatalf("non-continuation request must not arm same-account detached retry, got %q", got)
+	}
+	if got := shouldRetryMessagesDetachedSameAccount(true, resolved, true, false, 0, 1); got != "" {
+		t.Fatalf("no remaining retry budget must not arm same-account detached retry, got %q", got)
+	}
+}
