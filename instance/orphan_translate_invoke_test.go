@@ -153,6 +153,9 @@ func TestDoOrphanTranslateResponsesProxyWithTurnReusesAgentHeaders(t *testing.T)
 	if err != nil {
 		t.Fatalf("AddAccount: %v", err)
 	}
+	if _, err := store.UpdateAccount(account.ID, map[string]interface{}{"workerUrl": "http://127.0.0.1:1"}); err != nil {
+		t.Fatalf("UpdateAccount workerUrl: %v", err)
+	}
 
 	baseTurn := copilotTurnRequest{
 		Context: copilotTurnContext{
@@ -167,6 +170,9 @@ func TestDoOrphanTranslateResponsesProxyWithTurnReusesAgentHeaders(t *testing.T)
 
 	withStreamingClient(t, &http.Client{
 		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Path != "/chat/completions" {
+				t.Fatalf("path = %q", req.URL.Path)
+			}
 			assertHeaderValue(t, req.Header, "X-Interaction-Type", copilotInteractionTypeAgent)
 			assertHeaderValue(t, req.Header, "X-Initiator", "agent")
 			assertHeaderValue(t, req.Header, "X-Interaction-Id", "interaction-1")
@@ -326,6 +332,9 @@ func TestDoOrphanTranslateMessagesProxyWithTurnReusesAgentHeaders(t *testing.T) 
 	if err != nil {
 		t.Fatalf("AddAccount: %v", err)
 	}
+	if _, err := store.UpdateAccount(account.ID, map[string]interface{}{"workerUrl": "http://127.0.0.1:1"}); err != nil {
+		t.Fatalf("UpdateAccount workerUrl: %v", err)
+	}
 
 	baseTurn := copilotTurnRequest{
 		Context: copilotTurnContext{
@@ -340,6 +349,9 @@ func TestDoOrphanTranslateMessagesProxyWithTurnReusesAgentHeaders(t *testing.T) 
 
 	withStreamingClient(t, &http.Client{
 		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Path != "/chat/completions" {
+				t.Fatalf("path = %q", req.URL.Path)
+			}
 			assertHeaderValue(t, req.Header, "X-Interaction-Type", copilotInteractionTypeAgent)
 			assertHeaderValue(t, req.Header, "X-Initiator", "agent")
 			assertHeaderValue(t, req.Header, "X-Interaction-Id", "interaction-2")
