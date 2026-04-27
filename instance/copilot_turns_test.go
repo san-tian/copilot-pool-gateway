@@ -157,7 +157,7 @@ func TestDoResponsesProxyEmitsContinuationHeaders(t *testing.T) {
 	})})
 
 	body := []byte(`{"model":"gpt-4o","input":[{"role":"user","content":"next"}],"previous_response_id":"resp_prev"}`)
-	resp, forwardedBody, turnRequest, err := DoResponsesProxy("acct-1", testState(), body)
+	resp, forwardedBody, turnRequest, err := DoResponsesProxy("acct-1", testState(), body, "")
 	if err != nil {
 		t.Fatalf("DoResponsesProxy returned error: %v", err)
 	}
@@ -207,7 +207,7 @@ func TestDoResponsesProxyUsesFunctionCallOutputContextWithoutPreviousResponseID(
 	})})
 
 	body := []byte(`{"model":"gpt-4o","input":[{"type":"function_call_output","call_id":"call_1","output":"ok"}]}`)
-	resp, _, turnRequest, err := DoResponsesProxy("acct-1", testState(), body)
+	resp, _, turnRequest, err := DoResponsesProxy("acct-1", testState(), body, "")
 	if err != nil {
 		t.Fatalf("DoResponsesProxy returned error: %v", err)
 	}
@@ -248,7 +248,7 @@ func TestDoResponsesProxyViaWorkerForwardsContinuationHeaders(t *testing.T) {
 		}, nil
 	})})
 
-	resp, _, turnRequest, err := DoResponsesProxy(account.ID, testState(), []byte(`{"model":"gpt-5.4","input":[{"type":"function_call_output","call_id":"call_1","output":"ok"}]}`))
+	resp, _, turnRequest, err := DoResponsesProxy(account.ID, testState(), []byte(`{"model":"gpt-5.4","input":[{"type":"function_call_output","call_id":"call_1","output":"ok"}]}`), "")
 	if err != nil {
 		t.Fatalf("DoResponsesProxy returned error: %v", err)
 	}
@@ -284,7 +284,7 @@ func TestDoResponsesProxyPreservesParallelToolCalls(t *testing.T) {
 	})})
 
 	body := []byte(`{"model":"gpt-4o","parallel_tool_calls":true,"input":"use both tools","tools":[{"type":"function","name":"weather","parameters":{"type":"object"}},{"type":"function","name":"time","parameters":{"type":"object"}}]}`)
-	resp, forwardedBody, _, err := DoResponsesProxy("acct-1", testState(), body)
+	resp, forwardedBody, _, err := DoResponsesProxy("acct-1", testState(), body, "")
 	if err != nil {
 		t.Fatalf("DoResponsesProxy returned error: %v", err)
 	}

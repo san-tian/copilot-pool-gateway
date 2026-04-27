@@ -64,7 +64,7 @@ func TestDoOrphanTranslateResponsesProxyFallsBackWithoutWorkerURL(t *testing.T) 
 		CopilotToken:  "copilot-token",
 		VSCodeVersion: "1.99.0",
 		AccountType:   "individual",
-	}, []byte(`{"model":"gpt-4o-mini","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}`))
+	}, []byte(`{"model":"gpt-4o-mini","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}`), "")
 	if err != nil {
 		t.Fatalf("DoOrphanTranslateResponsesProxy returned error: %v", err)
 	}
@@ -114,7 +114,7 @@ func TestDoOrphanTranslateResponsesProxyDirectFallbackWrapsStreamingSuccess(t *t
 		CopilotToken:  "copilot-token",
 		VSCodeVersion: "1.99.0",
 		AccountType:   "individual",
-	}, []byte(`{"model":"gpt-4o-mini","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}`))
+	}, []byte(`{"model":"gpt-4o-mini","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}`), "")
 	if err != nil {
 		t.Fatalf("DoOrphanTranslateResponsesProxy returned error: %v", err)
 	}
@@ -190,7 +190,7 @@ func TestDoOrphanTranslateResponsesProxyWithTurnReusesAgentHeaders(t *testing.T)
 		CopilotToken:  "copilot-token",
 		VSCodeVersion: "1.99.0",
 		AccountType:   "individual",
-	}, []byte(`{"model":"gpt-4o-mini","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}`), baseTurn)
+	}, []byte(`{"model":"gpt-4o-mini","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}`), baseTurn, "")
 	if err != nil {
 		t.Fatalf("DoOrphanTranslateResponsesProxyWithTurn returned error: %v", err)
 	}
@@ -239,7 +239,7 @@ func TestDoOrphanTranslateMessagesProxyFallsBackWithoutWorkerURL(t *testing.T) {
 		CopilotToken:  "copilot-token",
 		VSCodeVersion: "1.99.0",
 		AccountType:   "individual",
-	}, []byte(`{"model":"gpt-5.4","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}`))
+	}, []byte(`{"model":"gpt-5.4","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}`), "")
 	if err != nil {
 		t.Fatalf("DoOrphanTranslateMessagesProxy returned error: %v", err)
 	}
@@ -293,7 +293,7 @@ func TestDoOrphanTranslateMessagesProxyDirectFallbackWrapsStreamingSuccess(t *te
 		CopilotToken:  "copilot-token",
 		VSCodeVersion: "1.99.0",
 		AccountType:   "individual",
-	}, []byte(`{"model":"gpt-5.4","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}`))
+	}, []byte(`{"model":"gpt-5.4","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}`), "")
 	if err != nil {
 		t.Fatalf("DoOrphanTranslateMessagesProxy returned error: %v", err)
 	}
@@ -369,7 +369,7 @@ func TestDoOrphanTranslateMessagesProxyWithTurnReusesAgentHeaders(t *testing.T) 
 		CopilotToken:  "copilot-token",
 		VSCodeVersion: "1.99.0",
 		AccountType:   "individual",
-	}, []byte(`{"model":"gpt-5.4","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}`), baseTurn)
+	}, []byte(`{"model":"gpt-5.4","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}`), baseTurn, "")
 	if err != nil {
 		t.Fatalf("DoOrphanTranslateMessagesProxyWithTurn returned error: %v", err)
 	}
@@ -411,7 +411,7 @@ func TestDoOrphanTranslateMessagesProxyDirectFallbackUsesMaxCompletionTokensForG
 		CopilotToken:  "copilot-token",
 		VSCodeVersion: "1.99.0",
 		AccountType:   "individual",
-	}, []byte(`{"model":"gpt-5.4","max_output_tokens":64,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]},{"type":"function_call","call_id":"call_1","name":"noop","arguments":"{}"},{"type":"function_call_output","call_id":"call_1","output":"ok"}]}`))
+	}, []byte(`{"model":"gpt-5.4","max_output_tokens":64,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]},{"type":"function_call","call_id":"call_1","name":"noop","arguments":"{}"},{"type":"function_call_output","call_id":"call_1","output":"ok"}]}`), "")
 	if err != nil {
 		t.Fatalf("DoOrphanTranslateMessagesProxy returned error: %v", err)
 	}

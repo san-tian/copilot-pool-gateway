@@ -51,15 +51,15 @@ func mergeHeaderSets(base, extra http.Header) http.Header {
 //
 // When the resolved account has no WorkerURL, the gateway falls back to a
 // direct upstream /chat/completions proxy using the translated payload.
-func DoOrphanTranslateResponsesProxy(accountID string, state *config.State, bodyBytes []byte) (*http.Response, []byte, copilotTurnRequest, error) {
-	return doOrphanTranslateResponsesProxy(accountID, state, bodyBytes, copilotTurnRequest{})
+func DoOrphanTranslateResponsesProxy(accountID string, state *config.State, bodyBytes []byte, traceID string) (*http.Response, []byte, copilotTurnRequest, error) {
+	return doOrphanTranslateResponsesProxy(accountID, state, bodyBytes, copilotTurnRequest{}, traceID)
 }
 
-func DoOrphanTranslateResponsesProxyWithTurn(accountID string, state *config.State, bodyBytes []byte, baseTurn CopilotTurnRequest) (*http.Response, []byte, copilotTurnRequest, error) {
-	return doOrphanTranslateResponsesProxy(accountID, state, bodyBytes, baseTurn)
+func DoOrphanTranslateResponsesProxyWithTurn(accountID string, state *config.State, bodyBytes []byte, baseTurn CopilotTurnRequest, traceID string) (*http.Response, []byte, copilotTurnRequest, error) {
+	return doOrphanTranslateResponsesProxy(accountID, state, bodyBytes, baseTurn, traceID)
 }
 
-func doOrphanTranslateResponsesProxy(accountID string, state *config.State, bodyBytes []byte, baseTurn copilotTurnRequest) (*http.Response, []byte, copilotTurnRequest, error) {
+func doOrphanTranslateResponsesProxy(accountID string, state *config.State, bodyBytes []byte, baseTurn copilotTurnRequest, traceID string) (*http.Response, []byte, copilotTurnRequest, error) {
 	turnRequest := recoveryCopilotTurnRequest(baseTurn, "orphan_translate_fresh", "orphan_translate_reuse_turn")
 
 	workerURL := ""
@@ -107,15 +107,15 @@ func doOrphanTranslateResponsesProxy(accountID string, state *config.State, body
 		callMs int64
 	)
 	if workerURL != "" {
-		resp, err = ProxyRequestViaWorker(context.Background(), workerURL, "POST", "/v1/chat/completions", chatBody, turnRequest.Headers())
+		resp, err = ProxyRequestViaWorker(context.Background(), workerURL, "POST", "/v1/chat/completions", chatBody, turnRequest.Headers(), traceID)
 		callMs = time.Since(start).Milliseconds()
 		if err != nil {
-			log.Printf("[responses account=%s] orphan_translate worker call failed worker=%s worker_ms=%d: %v",
-				accountID, workerURL, callMs, err)
+			log.Printf("[responses account=%s trace=%s] orphan_translate worker call failed worker=%s worker_ms=%d: %v",
+				accountID, traceID, workerURL, callMs, err)
 			return resp, bodyBytes, turnRequest, err
 		}
-		log.Printf("[responses account=%s] orphan_translate worker=%s worker_ms=%d status=%d ct=%q",
-			accountID, workerURL, callMs, resp.StatusCode, resp.Header.Get("Content-Type"))
+		log.Printf("[responses account=%s trace=%s] orphan_translate worker=%s worker_ms=%d status=%d ct=%q",
+			accountID, traceID, workerURL, callMs, resp.StatusCode, resp.Header.Get("Content-Type"))
 	} else {
 		normalizedBody, extraHeaders, hasVision, normErr := normalizeCompletionsPayload(state, chatBody)
 		if normErr != nil {

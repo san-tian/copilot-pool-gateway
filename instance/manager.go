@@ -451,20 +451,32 @@ func copyNonCopilotHeaders(dst, src http.Header) {
 // bound to loopback. The worker owns payload translation (compact, tool rewrites, stream-id
 // sync, web-search filter). When the gateway has already resolved Copilot turn context for a
 // request, it can also forward that context via X-Interaction-* / X-Initiator headers.
-func ProxyRequestViaWorker(ctx context.Context, workerURL, method, path string, bodyBytes []byte, clientHeaders http.Header) (*http.Response, error) {
+func ProxyRequestViaWorker(ctx context.Context, workerURL, method, path string, bodyBytes []byte, clientHeaders http.Header, traceID string) (*http.Response, error) {
 	target := strings.TrimRight(workerURL, "/") + path
 	req, err := http.NewRequestWithContext(ctx, method, target, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return nil, err
 	}
 	copyNonCopilotHeaders(req.Header, clientHeaders)
+	if strings.TrimSpace(traceID) != "" {
+		req.Header.Set("X-Trace-Id", traceID)
+	}
 	if req.Header.Get("Content-Type") == "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	if req.Header.Get("Accept") == "" {
 		req.Header.Set("Accept", "text/event-stream, application/json")
 	}
-	return getWorkerClient().Do(req)
+	start := time.Now()
+	log.Printf("[worker-hop trace=%s] dispatch method=%s path=%s target=%s body_bytes=%d", traceID, method, path, target, len(bodyBytes))
+	resp, err := getWorkerClient().Do(req)
+	statusCode := 0
+	if resp != nil {
+		statusCode = resp.StatusCode
+	}
+	log.Printf("[worker-hop trace=%s] complete method=%s path=%s target=%s status=%d elapsed_ms=%d err=%v",
+		traceID, method, path, target, statusCode, time.Since(start).Milliseconds(), err)
+	return resp, err
 }
 
 func ProxyRequestWithBytesCtx(ctx context.Context, state *config.State, method, path string, bodyBytes []byte, extraHeaders http.Header, hasVision bool) (*http.Response, error) {

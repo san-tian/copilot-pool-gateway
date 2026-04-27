@@ -21,7 +21,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-type responsesInvokeFunc func(accountID string, state *config.State, bodyBytes []byte) (*http.Response, []byte, instance.CopilotTurnRequest, error)
+type responsesInvokeFunc func(accountID string, state *config.State, bodyBytes []byte, traceID string) (*http.Response, []byte, instance.CopilotTurnRequest, error)
 
 func newRequestID() string {
 	var b [6]byte
@@ -152,7 +152,7 @@ func RegisterProxy(r *gin.Engine) {
 	}
 
 	api := r.Group("")
-	api.Use(proxyAuth())
+	api.Use(proxyTrace(), proxyAuth())
 
 	// OpenAI compatible endpoints
 	api.POST("/chat/completions", proxyCompletions)
@@ -818,6 +818,8 @@ func proxyCompletions(c *gin.Context) {
 	if isPool == true {
 		maxAttempts = 3
 	}
+	traceID := currentTraceID(c)
+	reqID := newRequestID()
 
 	// Read body once for potential retries.
 	bodyBytes, err := io.ReadAll(c.Request.Body)
@@ -828,6 +830,8 @@ func proxyCompletions(c *gin.Context) {
 
 	requestedModel := extractRequestedModel(bodyBytes)
 	previousResponseID := extractPreviousResponseID(bodyBytes)
+	log.Printf("[completions rid=%s trace=%s] recv model=%q prev_id=%q pool=%v body_bytes=%d",
+		reqID, traceID, requestedModel, previousResponseID, isPool == true, len(bodyBytes))
 	exclude := make(map[string]bool)
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		var resolved *resolvedAccount
@@ -861,7 +865,8 @@ func proxyCompletions(c *gin.Context) {
 			}
 			if attempt < maxAttempts-1 {
 				exclude[resolved.AccountID] = true
-				log.Printf("Completions proxy error for account %s, retrying: %v", resolved.AccountID, proxyErr)
+				log.Printf("[completions rid=%s trace=%s attempt=%d] proxy error account=%s retrying: %v",
+					reqID, traceID, attempt, resolved.AccountID, proxyErr)
 				continue
 			}
 			c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("proxy request failed: %v", proxyErr)})
@@ -874,7 +879,8 @@ func proxyCompletions(c *gin.Context) {
 			if attempt < maxAttempts-1 {
 				_ = resp.Body.Close()
 				exclude[resolved.AccountID] = true
-				log.Printf("Disabled unhealthy account %s after upstream error (%s), retrying", resolved.AccountID, reason)
+				log.Printf("[completions rid=%s trace=%s attempt=%d] disabled account=%s reason=%q retrying",
+					reqID, traceID, attempt, resolved.AccountID, reason)
 				continue
 			}
 		}
@@ -884,12 +890,15 @@ func proxyCompletions(c *gin.Context) {
 			instance.RecordRequest(resolved.AccountID, true, is429)
 			_ = resp.Body.Close()
 			exclude[resolved.AccountID] = true
-			log.Printf("Upstream returned %d for account %s, retrying with different account", resp.StatusCode, resolved.AccountID)
+			log.Printf("[completions rid=%s trace=%s attempt=%d] upstream_status=%d account=%s retrying",
+				reqID, traceID, attempt, resp.StatusCode, resolved.AccountID)
 			continue
 		}
 
 		// Forward the response.
-		c.Set("respReqID", newRequestID())
+		log.Printf("[completions rid=%s trace=%s attempt=%d] forwarding upstream_status=%d account=%s",
+			reqID, traceID, attempt, resp.StatusCode, resolved.AccountID)
+		c.Set("respReqID", reqID)
 		c.Set("respAccountID", resolved.AccountID)
 		instance.ForwardCompletionsResponse(c, resp)
 		return
@@ -982,6 +991,8 @@ func proxyMessages(c *gin.Context) {
 	if isPool == true {
 		maxAttempts = 3
 	}
+	traceID := currentTraceID(c)
+	reqID := newRequestID()
 
 	bodyBytes, err := io.ReadAll(c.Request.Body)
 	if err != nil {
@@ -992,6 +1003,8 @@ func proxyMessages(c *gin.Context) {
 	requestedModel := extractRequestedModel(bodyBytes)
 	toolResultIDs := extractMessageToolResultIDs(bodyBytes)
 	continuationRequested := len(toolResultIDs) > 0
+	log.Printf("[messages rid=%s trace=%s] recv model=%q continuation=%v tool_result_ids=%v pool=%v body_bytes=%d",
+		reqID, traceID, requestedModel, continuationRequested, toolResultIDs, isPool == true, len(bodyBytes))
 	exclude := make(map[string]bool)
 	crossAccountRollover := false
 	for attempt := 0; attempt < maxAttempts; attempt++ {
@@ -1032,12 +1045,14 @@ func proxyMessages(c *gin.Context) {
 				if continuationRequested && isPool == true {
 					exclude[resolved.AccountID] = true
 					crossAccountRollover = true
-					log.Printf("Messages detached continuation failed for account %s, retrying different account: %v", resolved.AccountID, proxyErr)
+					log.Printf("[messages rid=%s trace=%s attempt=%d] detached continuation failed account=%s retrying: %v",
+						reqID, traceID, attempt, resolved.AccountID, proxyErr)
 					continue
 				}
 				if !continuationRequested {
 					exclude[resolved.AccountID] = true
-					log.Printf("Messages proxy error for account %s, retrying: %v", resolved.AccountID, proxyErr)
+					log.Printf("[messages rid=%s trace=%s attempt=%d] proxy error account=%s retrying: %v",
+						reqID, traceID, attempt, resolved.AccountID, proxyErr)
 					continue
 				}
 			}
@@ -1052,7 +1067,8 @@ func proxyMessages(c *gin.Context) {
 				if attempt < maxAttempts-1 && isPool == true {
 					exclude[resolved.AccountID] = true
 					crossAccountRollover = true
-					log.Printf("Messages detached continuation unexpectedly replay-invalid for account %s, retrying different account: %s", resolved.AccountID, detail)
+					log.Printf("[messages rid=%s trace=%s attempt=%d] detached continuation replay-invalid account=%s retrying: %s",
+						reqID, traceID, attempt, resolved.AccountID, detail)
 					continue
 				}
 				c.JSON(http.StatusBadGateway, gin.H{"error": "message continuation recovery failed"})
@@ -1067,12 +1083,14 @@ func proxyMessages(c *gin.Context) {
 				if continuationRequested && isPool == true {
 					exclude[resolved.AccountID] = true
 					crossAccountRollover = true
-					log.Printf("Disabled unhealthy account %s after detached message continuation error (%s), retrying different account", resolved.AccountID, reason)
+					log.Printf("[messages rid=%s trace=%s attempt=%d] disabled account=%s detached continuation reason=%q retrying",
+						reqID, traceID, attempt, resolved.AccountID, reason)
 					continue
 				}
 				if !continuationRequested {
 					exclude[resolved.AccountID] = true
-					log.Printf("Disabled unhealthy account %s after upstream error (%s), retrying", resolved.AccountID, reason)
+					log.Printf("[messages rid=%s trace=%s attempt=%d] disabled account=%s reason=%q retrying",
+						reqID, traceID, attempt, resolved.AccountID, reason)
 					continue
 				}
 			}
@@ -1085,16 +1103,20 @@ func proxyMessages(c *gin.Context) {
 			if continuationRequested && isPool == true {
 				exclude[resolved.AccountID] = true
 				crossAccountRollover = true
-				log.Printf("Detached message continuation returned %d for account %s, retrying with different account", resp.StatusCode, resolved.AccountID)
+				log.Printf("[messages rid=%s trace=%s attempt=%d] detached continuation upstream_status=%d account=%s retrying",
+					reqID, traceID, attempt, resp.StatusCode, resolved.AccountID)
 				continue
 			}
 			if !continuationRequested {
 				exclude[resolved.AccountID] = true
-				log.Printf("Upstream returned %d for account %s, retrying with different account", resp.StatusCode, resolved.AccountID)
+				log.Printf("[messages rid=%s trace=%s attempt=%d] upstream_status=%d account=%s retrying",
+					reqID, traceID, attempt, resp.StatusCode, resolved.AccountID)
 				continue
 			}
 		}
 
+		log.Printf("[messages rid=%s trace=%s attempt=%d] forwarding upstream_status=%d account=%s",
+			reqID, traceID, attempt, resp.StatusCode, resolved.AccountID)
 		instance.ForwardMessagesResponse(c, resolved.AccountID, turnRequest, resp, bodyBytes)
 		return
 	}
@@ -1385,6 +1407,7 @@ func proxyResponses(c *gin.Context) {
 	// 401s would exhaust the 3-attempt budget on A+B without ever trying C.
 	attemptLimit := maxAttempts
 
+	traceID := currentTraceID(c)
 	reqID := newRequestID()
 	poolStrategy := ""
 	if s, ok := c.Get("poolStrategy"); ok {
@@ -1431,8 +1454,8 @@ func proxyResponses(c *gin.Context) {
 	if len(functionCallOutputIDs) > 0 {
 		fcSticky, fcStickyOK = instance.LookupResponseFunctionCallAccount(functionCallOutputIDs)
 	}
-	log.Printf("[responses rid=%s] recv model=%q prev_id=%q fc_ids=%v pool=%v strategy=%q affinity_source=%q continuation=%v body_bytes=%d body_read_ms=%d prev_sticky_replay=%q(%v) prev_sticky_turn=%q(%v) fc_sticky=%q(%v)",
-		reqID, requestedModel, previousResponseID, functionCallOutputIDs, isPool == true, poolStrategy, affinitySource, continuationRequested, len(bodyBytes), bodyReadMs,
+	log.Printf("[responses rid=%s trace=%s] recv model=%q prev_id=%q fc_ids=%v pool=%v strategy=%q affinity_source=%q continuation=%v body_bytes=%d body_read_ms=%d prev_sticky_replay=%q(%v) prev_sticky_turn=%q(%v) fc_sticky=%q(%v)",
+		reqID, traceID, requestedModel, previousResponseID, functionCallOutputIDs, isPool == true, poolStrategy, affinitySource, continuationRequested, len(bodyBytes), bodyReadMs,
 		prevStickyReplay, prevStickyReplayOK, prevStickyTurn, prevStickyTurnOK, fcSticky, fcStickyOK)
 
 	// Strict per-session binding for continuation requests.
@@ -1659,8 +1682,8 @@ func proxyResponses(c *gin.Context) {
 				Continuation:  continuationRequested,
 			})
 		}
-		log.Printf("[responses rid=%s attempt=%d] resolved account=%s sticky_kind=%s fell_back=%v cross_rollover=%v session_affinity=%q exclude=%v recovery_route=%s recovery_from_account=%q recovery_to_account=%q recovery_reason=%q",
-			reqID, attempt, resolved.AccountID, stickyKind, fellBackToPool, crossAccountRollover, affinityStatus, exclude,
+		log.Printf("[responses rid=%s trace=%s attempt=%d] resolved account=%s sticky_kind=%s fell_back=%v cross_rollover=%v session_affinity=%q exclude=%v recovery_route=%s recovery_from_account=%q recovery_to_account=%q recovery_reason=%q",
+			reqID, traceID, attempt, resolved.AccountID, stickyKind, fellBackToPool, crossAccountRollover, affinityStatus, exclude,
 			recovery.Route.logName(), recovery.FromAccount, resolved.AccountID, recovery.Reason)
 
 		if !checkRateLimit(c, resolved.AccountID) {
@@ -1699,8 +1722,8 @@ func proxyResponses(c *gin.Context) {
 		if recovery.Route == orphanTranslateRouteChat {
 			if replayInvalidRecoveryTurnSet {
 				baseTurn := replayInvalidRecoveryTurn
-				invoke = func(accountID string, state *config.State, bodyBytes []byte) (*http.Response, []byte, instance.CopilotTurnRequest, error) {
-					return instance.DoOrphanTranslateResponsesProxyWithTurn(accountID, state, bodyBytes, baseTurn)
+				invoke = func(accountID string, state *config.State, bodyBytes []byte, traceID string) (*http.Response, []byte, instance.CopilotTurnRequest, error) {
+					return instance.DoOrphanTranslateResponsesProxyWithTurn(accountID, state, bodyBytes, baseTurn, traceID)
 				}
 			} else {
 				invoke = instance.DoOrphanTranslateResponsesProxy
@@ -1710,22 +1733,22 @@ func proxyResponses(c *gin.Context) {
 		if recovery.Route == orphanTranslateRouteMessages {
 			if replayInvalidRecoveryTurnSet {
 				baseTurn := replayInvalidRecoveryTurn
-				invoke = func(accountID string, state *config.State, bodyBytes []byte) (*http.Response, []byte, instance.CopilotTurnRequest, error) {
-					return instance.DoOrphanTranslateMessagesProxyWithTurn(accountID, state, bodyBytes, baseTurn)
+				invoke = func(accountID string, state *config.State, bodyBytes []byte, traceID string) (*http.Response, []byte, instance.CopilotTurnRequest, error) {
+					return instance.DoOrphanTranslateMessagesProxyWithTurn(accountID, state, bodyBytes, baseTurn, traceID)
 				}
 			} else {
 				invoke = instance.DoOrphanTranslateMessagesProxy
 			}
 			modeName = recovery.Route.modeName()
 		}
-		log.Printf("[responses rid=%s attempt=%d] mode=%s can_detach=%v account=%s",
-			reqID, attempt, modeName, continuationCanDetach, resolved.AccountID)
+		log.Printf("[responses rid=%s trace=%s attempt=%d] mode=%s can_detach=%v account=%s recovery_route=%s",
+			reqID, traceID, attempt, modeName, continuationCanDetach, resolved.AccountID, recovery.Route.logName())
 
 		invokeStart := time.Now()
-		resp, forwardedBody, turnRequest, proxyErr := invoke(resolved.AccountID, resolved.State, bodyBytes)
+		resp, forwardedBody, turnRequest, proxyErr := invoke(resolved.AccountID, resolved.State, bodyBytes, traceID)
 		invokeMs := time.Since(invokeStart).Milliseconds()
-		log.Printf("[responses rid=%s attempt=%d] turn_ctx=%s interaction_type=%s invoke_ms=%d",
-			reqID, attempt, turnRequest.CacheSource, turnRequest.InteractionType, invokeMs)
+		log.Printf("[responses rid=%s trace=%s attempt=%d] turn_ctx=%s interaction_type=%s invoke_ms=%d",
+			reqID, traceID, attempt, turnRequest.CacheSource, turnRequest.InteractionType, invokeMs)
 		if proxyErr != nil {
 			if resp != nil {
 				_ = resp.Body.Close()
@@ -1937,8 +1960,8 @@ func proxyResponses(c *gin.Context) {
 			log.Printf("[responses rid=%s attempt=%d] post-degrade %d body on account=%s (final): %q",
 				reqID, attempt, resp.StatusCode, resolved.AccountID, peekAndRestoreBody(resp, 400))
 		}
-		log.Printf("[responses rid=%s attempt=%d] forwarding upstream_status=%d account=%s mode=%s invoke_ms=%d",
-			reqID, attempt, resp.StatusCode, resolved.AccountID, modeName, invokeMs)
+		log.Printf("[responses rid=%s trace=%s attempt=%d] forwarding upstream_status=%d account=%s mode=%s invoke_ms=%d",
+			reqID, traceID, attempt, resp.StatusCode, resolved.AccountID, modeName, invokeMs)
 		c.Set("respReqID", reqID)
 		instance.ForwardResponsesResponse(c, resolved.AccountID, turnRequest, forwardedBody, resp)
 		return

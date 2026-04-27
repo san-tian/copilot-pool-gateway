@@ -26,19 +26,19 @@ const (
 )
 
 // DoResponsesProxy forwards requests directly to GitHub Copilot /responses endpoint.
-func DoResponsesProxy(accountID string, state *config.State, bodyBytes []byte) (*http.Response, []byte, copilotTurnRequest, error) {
-	return doResponsesProxy(accountID, state, bodyBytes, responsesProxyModeDirect)
+func DoResponsesProxy(accountID string, state *config.State, bodyBytes []byte, traceID string) (*http.Response, []byte, copilotTurnRequest, error) {
+	return doResponsesProxy(accountID, state, bodyBytes, responsesProxyModeDirect, traceID)
 }
 
-func DoDetachedResponsesProxy(accountID string, state *config.State, bodyBytes []byte) (*http.Response, []byte, copilotTurnRequest, error) {
-	return doResponsesProxy(accountID, state, bodyBytes, responsesProxyModeDetachedSameAccount)
+func DoDetachedResponsesProxy(accountID string, state *config.State, bodyBytes []byte, traceID string) (*http.Response, []byte, copilotTurnRequest, error) {
+	return doResponsesProxy(accountID, state, bodyBytes, responsesProxyModeDetachedSameAccount, traceID)
 }
 
-func DoDetachedResponsesProxyCrossAccount(accountID string, state *config.State, bodyBytes []byte) (*http.Response, []byte, copilotTurnRequest, error) {
-	return doResponsesProxy(accountID, state, bodyBytes, responsesProxyModeDetachedCrossAccount)
+func DoDetachedResponsesProxyCrossAccount(accountID string, state *config.State, bodyBytes []byte, traceID string) (*http.Response, []byte, copilotTurnRequest, error) {
+	return doResponsesProxy(accountID, state, bodyBytes, responsesProxyModeDetachedCrossAccount, traceID)
 }
 
-func doResponsesProxy(accountID string, state *config.State, bodyBytes []byte, mode responsesProxyMode) (*http.Response, []byte, copilotTurnRequest, error) {
+func doResponsesProxy(accountID string, state *config.State, bodyBytes []byte, mode responsesProxyMode, traceID string) (*http.Response, []byte, copilotTurnRequest, error) {
 	turnRequest := newCopilotTurnRequest(copilotInteractionTypeUser)
 
 	// Resolve per-account worker routing. When an account has WorkerURL set and
@@ -110,13 +110,13 @@ func doResponsesProxy(accountID string, state *config.State, bodyBytes []byte, m
 
 	if useWorker {
 		start := time.Now()
-		resp, err := ProxyRequestViaWorker(context.Background(), workerURL, "POST", "/v1/responses", bodyBytes, turnRequest.Headers())
+		resp, err := ProxyRequestViaWorker(context.Background(), workerURL, "POST", "/v1/responses", bodyBytes, turnRequest.Headers(), traceID)
 		statusCode := 0
 		if resp != nil {
 			statusCode = resp.StatusCode
 		}
-		log.Printf("[responses account=%s] worker=%s worker_ms=%d status=%d err=%v",
-			accountID, workerURL, time.Since(start).Milliseconds(), statusCode, err)
+		log.Printf("[responses account=%s trace=%s] worker=%s worker_ms=%d status=%d err=%v",
+			accountID, traceID, workerURL, time.Since(start).Milliseconds(), statusCode, err)
 		return resp, bodyBytes, turnRequest, err
 	}
 
