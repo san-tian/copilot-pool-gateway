@@ -77,6 +77,16 @@ func responsesSessionAffinityKey(c *gin.Context, body []byte) (string, string) {
 	return "", ""
 }
 
+func setResponsesSessionAffinityContext(c *gin.Context, isPool interface{}, body []byte) {
+	if isPool != true {
+		return
+	}
+	if key, source := responsesSessionAffinityKey(c, body); key != "" {
+		c.Set("responsesSessionAffinityKey", key)
+		c.Set("responsesSessionAffinitySource", source)
+	}
+}
+
 func usableAffinityValue(v string) string {
 	v = strings.TrimSpace(v)
 	if len(v) < 8 || len(v) > 512 {

@@ -90,6 +90,25 @@ func TestResponsesSessionAffinityKeyIgnoresShortValues(t *testing.T) {
 	}
 }
 
+func TestSetResponsesSessionAffinityContextPoolOnly(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Request.Header.Set("X-Copilot-Pool-Session", "session-header-123")
+
+	setResponsesSessionAffinityContext(c, false, []byte(`{}`))
+	if _, ok := c.Get("responsesSessionAffinityKey"); ok {
+		t.Fatalf("direct account request must not install responses session affinity")
+	}
+
+	setResponsesSessionAffinityContext(c, true, []byte(`{}`))
+	if key, ok := c.Get("responsesSessionAffinityKey"); !ok || key == "" {
+		t.Fatalf("pool request should install responses session affinity key")
+	}
+	if source, _ := c.Get("responsesSessionAffinitySource"); source != "X-Copilot-Pool-Session" {
+		t.Fatalf("source = %v, want X-Copilot-Pool-Session", source)
+	}
+}
+
 // writeSessionBindingError shapes the three continuation-failure responses
 // that codex / pi clients will observe when strict binding rejects a
 // continuation. Verify status codes, the discriminating `type` field, and

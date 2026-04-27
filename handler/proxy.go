@@ -807,12 +807,6 @@ func proxyCompletions(c *gin.Context) {
 	}
 
 	requestedModel := extractRequestedModel(bodyBytes)
-	if isPool == true {
-		if key, source := responsesSessionAffinityKey(c, bodyBytes); key != "" {
-			c.Set("responsesSessionAffinityKey", key)
-			c.Set("responsesSessionAffinitySource", source)
-		}
-	}
 	previousResponseID := extractPreviousResponseID(bodyBytes)
 	exclude := make(map[string]bool)
 	for attempt := 0; attempt < maxAttempts; attempt++ {
@@ -1341,6 +1335,7 @@ func proxyResponses(c *gin.Context) {
 	bodyBytes = rewriteFunctionCallOutputCallIDs(bodyBytes)
 
 	requestedModel := extractRequestedModel(bodyBytes)
+	setResponsesSessionAffinityContext(c, isPool, bodyBytes)
 	previousResponseID := extractPreviousResponseID(bodyBytes)
 	functionCallOutputIDs := extractResponseFunctionCallOutputIDs(bodyBytes)
 	continuationRequested := previousResponseID != "" || len(functionCallOutputIDs) > 0
