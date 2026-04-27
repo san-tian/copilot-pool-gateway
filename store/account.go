@@ -28,6 +28,10 @@ type Account struct {
 	ProbeCheckedAt    string   `json:"probeCheckedAt,omitempty"`
 	ProbeError        string   `json:"probeError,omitempty"`
 	WorkerURL         string   `json:"workerUrl,omitempty"`
+	WorkerManaged     bool     `json:"workerManaged,omitempty"`
+	WorkerPort        int      `json:"workerPort,omitempty"`
+	WorkerPID         int      `json:"workerPid,omitempty"`
+	WorkerHome        string   `json:"workerHome,omitempty"`
 }
 
 type PoolConfig struct {
@@ -411,6 +415,57 @@ func RegenerateApiKey(id string) (string, error) {
 		}
 	}
 	return "", nil
+}
+
+// UpdateAccountWorker atomically sets the supervisor-owned worker fields on an
+// account. Supervisor is the sole writer of these fields; they are NOT exposed
+// through the admin UpdateAccount map setter. Returns nil if the account was
+// not found (supervisor will have already cleaned up its in-memory entry).
+func UpdateAccountWorker(accountID, workerURL, home string, port, pid int) error {
+	accountMu.Lock()
+	defer accountMu.Unlock()
+
+	accounts, err := readAccounts()
+	if err != nil {
+		return err
+	}
+	for i, a := range accounts {
+		if a.ID != accountID {
+			continue
+		}
+		accounts[i].WorkerURL = strings.TrimSpace(workerURL)
+		accounts[i].WorkerHome = home
+		accounts[i].WorkerPort = port
+		accounts[i].WorkerPID = pid
+		accounts[i].WorkerManaged = true
+		return writeAccounts(accounts)
+	}
+	return nil
+}
+
+// ClearAccountWorker atomically zeroes the supervisor-owned worker fields on an
+// account. Called after Stop / RemoveAndCleanup / readiness-timeout rollback so
+// the persisted state matches "no live worker".
+func ClearAccountWorker(accountID string) error {
+	accountMu.Lock()
+	defer accountMu.Unlock()
+
+	accounts, err := readAccounts()
+	if err != nil {
+		return err
+	}
+	for i, a := range accounts {
+		if a.ID != accountID {
+			continue
+		}
+		accounts[i].WorkerURL = ""
+		accounts[i].WorkerHome = ""
+		accounts[i].WorkerPort = 0
+		accounts[i].WorkerPID = 0
+		accounts[i].WorkerManaged = false
+		return writeAccounts(accounts)
+	}
+	return nil
 }
 
 func GetPoolConfig() (*PoolConfig, error) {

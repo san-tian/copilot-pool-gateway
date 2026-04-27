@@ -6,7 +6,10 @@ import (
 	"strings"
 )
 
-const AppDirEnvVar = "COPILOT_API_APP_DIR"
+const (
+	AppDirEnvVar      = "COPILOT_API_APP_DIR"
+	WorkersRootEnvVar = "COPILOT_WORKERS_HOME"
+)
 
 var AppDir = resolveAppDirFromEnv()
 
@@ -43,6 +46,17 @@ func ModelMapFile() string {
 
 func ProxyConfigFile() string {
 	return filepath.Join(AppDir, "proxy-config.json")
+}
+
+func WorkersRoot() string {
+	if override := strings.TrimSpace(os.Getenv(WorkersRootEnvVar)); override != "" {
+		return override
+	}
+	return filepath.Join(AppDir, "workers")
+}
+
+func WorkerHomeFor(accountID string) string {
+	return filepath.Join(WorkersRoot(), accountID)
 }
 
 func EnsurePaths() error {

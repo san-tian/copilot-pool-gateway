@@ -122,6 +122,18 @@ func WorkerPoolMode() string {
 	return "auto"
 }
 
+// WorkerAutoAdopt controls whether the WorkerSupervisor auto-spawns a worker
+// child for an account when device-flow completes, and auto-cleans it on
+// account delete. Default on. Set to off/disabled/0/false to keep the classic
+// behavior (admin must fill WorkerURL manually / external worker lifecycle).
+func WorkerAutoAdopt() bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv("COPILOT_WORKER_AUTO_ADOPT")))
+	if v == "off" || v == "disabled" || v == "0" || v == "false" {
+		return false
+	}
+	return true
+}
+
 // OrphanPassthrough controls what happens when a /v1/responses request arrives
 // with function_call_output items whose call_ids the router's sticky cache
 // has never seen (the cross-relay migration scenario).

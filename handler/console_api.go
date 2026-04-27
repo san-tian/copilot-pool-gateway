@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/fs"
@@ -87,6 +88,7 @@ func registerProtectedConsoleAPI(protected *gin.RouterGroup, proxyPort int) {
 	protected.POST("/accounts/:id/start", handleStartAccount)
 	protected.POST("/accounts/:id/reprobe", handleReprobeAccount)
 	protected.POST("/accounts/:id/stop", handleStopAccount)
+	protected.POST("/accounts/:id/worker/restart", handleRestartWorker)
 	protected.GET("/accounts/:id/usage", handleGetAccountUsage)
 	protected.POST("/accounts/:id/public-reauth-session", handleCreatePublicReauthSession)
 
@@ -352,11 +354,52 @@ func handleDeleteAccount(c *gin.Context) {
 	id := c.Param("id")
 	instance.StopInstance(id)
 	instance.EvictAccountContinuationCaches(id)
+	// Phase 0c: tear down the supervised worker and wipe its api-home dir so
+	// a re-add of the same ID starts clean. Fail-soft: log and continue — the
+	// account row must still be deleted even if cleanup fails.
+	if sup := instance.DefaultSupervisor(); sup != nil {
+		if err := sup.RemoveAndCleanup(context.Background(), id); err != nil {
+			log.Printf("supervisor: remove-and-cleanup on delete %s: %v", id, err)
+		}
+	}
 	if err := store.DeleteAccount(id); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+// handleRestartWorker tears down the current supervised worker (if any) and
+// respawns it using the account's stored githubToken. Admin-triggered recovery
+// for the case where a worker child has wedged but the account is otherwise
+// healthy. Returns 404 if the supervisor is not wired or the account is absent,
+// 503 if worker auto-adopt is disabled (no stored token to spawn with).
+func handleRestartWorker(c *gin.Context) {
+	id := c.Param("id")
+	sup := instance.DefaultSupervisor()
+	if sup == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "supervisor not available"})
+		return
+	}
+	account, err := store.GetAccount(id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if account == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "account not found"})
+		return
+	}
+	if strings.TrimSpace(account.GithubToken) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "account has no github token; re-auth first"})
+		return
+	}
+	entry, err := sup.Restart(context.Background(), id, account.GithubToken)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"worker": entry})
 }
 
 func handleRegenerateKey(c *gin.Context) {

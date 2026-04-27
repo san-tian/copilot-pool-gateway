@@ -309,6 +309,54 @@ func TestDoMessagesProxyEmitsToolContinuationHeaders(t *testing.T) {
 	}
 }
 
+func TestDoMessagesProxyUsesMaxCompletionTokensForGpt5(t *testing.T) {
+	resetCopilotTurnCaches()
+	gin.SetMode(gin.TestMode)
+
+	var gotBody []byte
+	withStreamingClient(t, &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		gotBody, _ = io.ReadAll(req.Body)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"id":"chatcmpl-1","choices":[{"message":{"role":"assistant","content":"done"}}]}`)),
+		}, nil
+	})})
+
+	payload := anthropic.AnthropicMessagesPayload{
+		Model:     "gpt-5.4",
+		MaxTokens: 64,
+		Messages: []anthropic.AnthropicMessage{
+			{Role: "user", Content: "hello"},
+		},
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("failed to marshal payload: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+
+	resp, _, err := DoMessagesProxy(c, "acct-1", testState(), body)
+	if err != nil {
+		t.Fatalf("DoMessagesProxy returned error: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	var forwarded map[string]interface{}
+	if err := json.Unmarshal(gotBody, &forwarded); err != nil {
+		t.Fatalf("failed to unmarshal forwarded body: %v", err)
+	}
+	if _, ok := forwarded["max_tokens"]; ok {
+		t.Fatalf("expected max_tokens to be removed for gpt-5 messages proxy, got %s", string(gotBody))
+	}
+	if got, ok := forwarded["max_completion_tokens"].(float64); !ok || got != 64 {
+		t.Fatalf("expected max_completion_tokens=64, got %#v from %s", forwarded["max_completion_tokens"], string(gotBody))
+	}
+}
+
 func TestCurrentCompletionsInitiatorTracksTrailingMessage(t *testing.T) {
 	tests := []struct {
 		name     string
