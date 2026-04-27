@@ -1003,14 +1003,27 @@ func proxyMessages(c *gin.Context) {
 	requestedModel := extractRequestedModel(bodyBytes)
 	toolResultIDs := extractMessageToolResultIDs(bodyBytes)
 	continuationRequested := len(toolResultIDs) > 0
+	setMessagesSessionAffinityContext(c, isPool, bodyBytes)
 	log.Printf("[messages rid=%s trace=%s] recv model=%q continuation=%v tool_result_ids=%v pool=%v body_bytes=%d",
 		reqID, traceID, requestedModel, continuationRequested, toolResultIDs, isPool == true, len(bodyBytes))
 	exclude := make(map[string]bool)
 	crossAccountRollover := false
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		var resolved *resolvedAccount
+		replayBound := false
 		if continuationRequested && !crossAccountRollover {
 			resolved = resolveStateForMessageReplay(toolResultIDs, requestedModel)
+			replayBound = resolved != nil
+		}
+		if resolved == nil {
+			if affinityKey, ok := c.Get("messagesSessionAffinityKey"); ok {
+				if key, _ := affinityKey.(string); key != "" {
+					if affinityResolved := lookupMessagesSessionAffinity(key, requestedModel, exclude); affinityResolved != nil {
+						resolved = affinityResolved
+						c.Set("messagesSessionAffinityStatus", "hit")
+					}
+				}
+			}
 		}
 		if resolved == nil {
 			resolved = resolveState(c, exclude, requestedModel)
@@ -1026,7 +1039,7 @@ func proxyMessages(c *gin.Context) {
 		instance.RecordRequest(resolved.AccountID, false, false)
 
 		invoke := instance.DoMessagesProxy
-		detachedMode := continuationRequested
+		detachedMode := continuationRequested && !replayBound
 		if detachedMode {
 			invoke = instance.DoDetachedMessagesProxy
 		}
@@ -1067,8 +1080,8 @@ func proxyMessages(c *gin.Context) {
 				if attempt < maxAttempts-1 && isPool == true {
 					exclude[resolved.AccountID] = true
 					crossAccountRollover = true
-					log.Printf("[messages rid=%s trace=%s attempt=%d] detached continuation replay-invalid account=%s retrying: %s",
-						reqID, traceID, attempt, resolved.AccountID, detail)
+					log.Printf("[messages rid=%s trace=%s attempt=%d] continuation replay-invalid account=%s replay_bound=%v detached=%v retrying: %s",
+						reqID, traceID, attempt, resolved.AccountID, replayBound, detachedMode, detail)
 					continue
 				}
 				c.JSON(http.StatusBadGateway, gin.H{"error": "message continuation recovery failed"})
@@ -1103,8 +1116,8 @@ func proxyMessages(c *gin.Context) {
 			if continuationRequested && isPool == true {
 				exclude[resolved.AccountID] = true
 				crossAccountRollover = true
-				log.Printf("[messages rid=%s trace=%s attempt=%d] detached continuation upstream_status=%d account=%s retrying",
-					reqID, traceID, attempt, resp.StatusCode, resolved.AccountID)
+				log.Printf("[messages rid=%s trace=%s attempt=%d] continuation upstream_status=%d account=%s replay_bound=%v detached=%v retrying",
+					reqID, traceID, attempt, resp.StatusCode, resolved.AccountID, replayBound, detachedMode)
 				continue
 			}
 			if !continuationRequested {
@@ -1112,6 +1125,14 @@ func proxyMessages(c *gin.Context) {
 				log.Printf("[messages rid=%s trace=%s attempt=%d] upstream_status=%d account=%s retrying",
 					reqID, traceID, attempt, resp.StatusCode, resolved.AccountID)
 				continue
+			}
+		}
+
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			if affinityKey, ok := c.Get("messagesSessionAffinityKey"); ok {
+				if key, _ := affinityKey.(string); key != "" {
+					bindMessagesSessionAffinity(key, resolved.AccountID)
+				}
 			}
 		}
 
