@@ -171,12 +171,12 @@ func TestResolveContinuationBindingPrevIdMissesCache(t *testing.T) {
 func TestOrphanTranslateRouteForModel(t *testing.T) {
 	cases := []struct {
 		model string
-		want  string
+		want  orphanTranslateRoute
 	}{
-		{"gpt-5.4", "messages"},
-		{"claude-opus-4.7", "messages"},
-		{"gpt-4o-mini", "chat"},
-		{"", ""},
+		{"gpt-5.4", orphanTranslateRouteMessages},
+		{"claude-opus-4.7", orphanTranslateRouteMessages},
+		{"gpt-4o-mini", orphanTranslateRouteChat},
+		{"", orphanTranslateRouteNone},
 	}
 	for _, tc := range cases {
 		t.Run(tc.model, func(t *testing.T) {
@@ -184,5 +184,31 @@ func TestOrphanTranslateRouteForModel(t *testing.T) {
 				t.Fatalf("orphanTranslateRouteForModel(%q) = %q, want %q", tc.model, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestOrphanTranslateRouteModeNames(t *testing.T) {
+	cases := []struct {
+		route orphanTranslateRoute
+		want  string
+	}{
+		{orphanTranslateRouteChat, "orphan_translate"},
+		{orphanTranslateRouteMessages, "orphan_translate_messages"},
+		{orphanTranslateRouteNone, "direct"},
+	}
+	for _, tc := range cases {
+		if got := tc.route.modeName(); got != tc.want {
+			t.Fatalf("modeName(%q) = %q, want %q", tc.route, got, tc.want)
+		}
+	}
+}
+
+func TestContinuationRecoveryStateArmed(t *testing.T) {
+	if (continuationRecoveryState{}).armed() {
+		t.Fatalf("zero recovery state must not be armed")
+	}
+	recovery := continuationRecoveryState{Route: orphanTranslateRouteMessages, Reason: "replay-invalid", FromAccount: "acct-a"}
+	if !recovery.armed() {
+		t.Fatalf("messages recovery route should be armed")
 	}
 }

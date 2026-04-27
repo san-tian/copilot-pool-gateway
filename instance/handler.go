@@ -189,6 +189,10 @@ func doMessagesProxy(c *gin.Context, accountID string, state *config.State, body
 	if err != nil {
 		return nil, copilotTurnRequest{}, fmt.Errorf("failed to marshal request: %v", err)
 	}
+	openaiBytes, _, hasVision, err = normalizeCompletionsPayload(state, openaiBytes)
+	if err != nil {
+		return nil, copilotTurnRequest{}, err
+	}
 
 	turnRequest := buildMessagesTurnRequest(accountID, anthropicPayload)
 	if detached {

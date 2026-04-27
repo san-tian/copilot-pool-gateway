@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"copilot-go/anthropic"
 	"copilot-go/config"
 	"copilot-go/instance/orphan_translate"
 	"copilot-go/store"
@@ -23,7 +24,9 @@ import (
 //
 // Rationale: Copilot's /v1/chat/completions endpoint rejects the gpt-5 family
 // and Anthropic models with
-//   {"error":{"message":"Please use `/v1/responses` or `/v1/messages` API"}}
+//
+//	{"error":{"message":"Please use `/v1/responses` or `/v1/messages` API"}}
+//
 // — the DoOrphanTranslateResponsesProxy chat path therefore only works for
 // gpt-4o-style models. /v1/messages is stateless (like /v1/chat/completions)
 // but accepts both gpt-5.4 AND claude-*, which is the actual traffic mix we
@@ -35,9 +38,10 @@ import (
 // forwardResponsesStream and the absorbLine sticky-cache tee keep working
 // unchanged downstream.
 //
-// Only effective when config.ResponsesOrphanTranslate()=="on" AND the
-// resolved account has a WorkerURL. handler/proxy.go guards both and routes
-// by model family (gpt-5*/claude-* → messages path, else chat path).
+// When the resolved account has no WorkerURL, the gateway falls back to the
+// same direct /chat/completions bridge used by its native /v1/messages path.
+// handler/proxy.go routes by model family (gpt-5*/claude-* → messages path,
+// else chat path).
 func DoOrphanTranslateMessagesProxy(accountID string, state *config.State, bodyBytes []byte) (*http.Response, []byte, copilotTurnRequest, error) {
 	turnRequest := newCopilotTurnRequest(copilotInteractionTypeUser)
 	turnRequest.CacheSource = "orphan_translate_messages_fresh"
@@ -47,7 +51,7 @@ func DoOrphanTranslateMessagesProxy(accountID string, state *config.State, bodyB
 		workerURL = strings.TrimSpace(acct.WorkerURL)
 	}
 	if workerURL == "" {
-		return nil, bodyBytes, turnRequest, fmt.Errorf("orphan_translate_messages requires account.WorkerURL, account=%s has none", accountID)
+		log.Printf("[responses account=%s] orphan_translate_messages worker unavailable — falling back to direct upstream bridge", accountID)
 	}
 
 	// Force stream=true — the output translator only handles SSE. Capture the
@@ -67,12 +71,12 @@ func DoOrphanTranslateMessagesProxy(accountID string, state *config.State, bodyB
 	}
 
 	translateStart := time.Now()
-	messagesBody, stats, err := orphan_translate.ResponsesToMessages(bodyBytes)
+	messagesBody, stats, translateErr := orphan_translate.ResponsesToMessages(bodyBytes)
 	translateMs := time.Since(translateStart).Milliseconds()
-	if err != nil {
+	if translateErr != nil {
 		log.Printf("[responses account=%s] orphan_translate_messages request-translation failed translate_ms=%d: %v",
-			accountID, translateMs, err)
-		return nil, bodyBytes, turnRequest, err
+			accountID, translateMs, translateErr)
+		return nil, bodyBytes, turnRequest, translateErr
 	}
 	log.Printf("[responses account=%s] orphan_translate=messages worker=%s input_items=%d messages=%d dropped_reasoning=%d tools_in=%d tools_out=%d dropped_tools=%d translate_ms=%d",
 		accountID, workerURL,
@@ -81,15 +85,52 @@ func DoOrphanTranslateMessagesProxy(accountID string, state *config.State, bodyB
 		translateMs)
 
 	start := time.Now()
-	resp, err := ProxyRequestViaWorker(context.Background(), workerURL, "POST", "/v1/messages", messagesBody, nil)
-	workerMs := time.Since(start).Milliseconds()
-	if err != nil {
-		log.Printf("[responses account=%s] orphan_translate_messages worker call failed worker=%s worker_ms=%d: %v",
-			accountID, workerURL, workerMs, err)
-		return resp, bodyBytes, turnRequest, err
+	var (
+		resp   *http.Response
+		err    error
+		callMs int64
+	)
+	if workerURL != "" {
+		resp, err = ProxyRequestViaWorker(context.Background(), workerURL, "POST", "/v1/messages", messagesBody, nil)
+		callMs = time.Since(start).Milliseconds()
+		if err != nil {
+			log.Printf("[responses account=%s] orphan_translate_messages worker call failed worker=%s worker_ms=%d: %v",
+				accountID, workerURL, callMs, err)
+			return resp, bodyBytes, turnRequest, err
+		}
+		log.Printf("[responses account=%s] orphan_translate_messages worker=%s worker_ms=%d status=%d ct=%q",
+			accountID, workerURL, callMs, resp.StatusCode, resp.Header.Get("Content-Type"))
+	} else {
+		var anthropicPayload anthropic.AnthropicMessagesPayload
+		if err := json.Unmarshal(messagesBody, &anthropicPayload); err != nil {
+			return nil, bodyBytes, turnRequest, fmt.Errorf("failed to unmarshal translated messages payload: %v", err)
+		}
+		if anthropicPayload.MaxTokens == 0 {
+			copilotModelID := anthropic.NormalizeAnthropicModel(store.ToCopilotID(anthropicPayload.Model))
+			if limit := lookupMaxOutputTokens(state, copilotModelID); limit > 0 {
+				anthropicPayload.MaxTokens = limit
+			}
+		}
+		hasVision := checkVisionContent(anthropicPayload)
+		openaiPayload := anthropic.TranslateToOpenAI(anthropicPayload)
+		openaiBytes, marshalErr := json.Marshal(openaiPayload)
+		if marshalErr != nil {
+			return nil, bodyBytes, turnRequest, fmt.Errorf("failed to marshal translated openai payload: %v", marshalErr)
+		}
+		openaiBytes, _, hasVision, err = normalizeCompletionsPayload(state, openaiBytes)
+		if err != nil {
+			return nil, bodyBytes, turnRequest, err
+		}
+		resp, err = ProxyRequestWithBytes(state, "POST", "/chat/completions", openaiBytes, turnRequest.Headers(), hasVision)
+		callMs = time.Since(start).Milliseconds()
+		if err != nil {
+			log.Printf("[responses account=%s] orphan_translate_messages direct call failed direct_ms=%d: %v",
+				accountID, callMs, err)
+			return resp, bodyBytes, turnRequest, err
+		}
+		log.Printf("[responses account=%s] orphan_translate_messages direct_ms=%d status=%d ct=%q",
+			accountID, callMs, resp.StatusCode, resp.Header.Get("Content-Type"))
 	}
-	log.Printf("[responses account=%s] orphan_translate_messages worker=%s worker_ms=%d status=%d ct=%q",
-		accountID, workerURL, workerMs, resp.StatusCode, resp.Header.Get("Content-Type"))
 
 	// On non-2xx, let the caller see the raw error body. isRetryableStatus +
 	// disableOnFatalUpstream inspect StatusCode and sometimes sniff the body,
@@ -112,7 +153,11 @@ func DoOrphanTranslateMessagesProxy(accountID string, state *config.State, bodyB
 		return resp, bodyBytes, turnRequest, nil
 	}
 
-	resp.Body = orphan_translate.NewResponsesReaderFromMessages(resp.Body, model)
+	if workerURL != "" {
+		resp.Body = orphan_translate.NewResponsesReaderFromMessages(resp.Body, model)
+	} else {
+		resp.Body = orphan_translate.NewResponsesReader(resp.Body, model)
+	}
 	resp.Header.Set("Content-Type", "text/event-stream")
 	resp.Header.Del("Content-Length")
 

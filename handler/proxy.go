@@ -535,13 +535,14 @@ func resolveState(c *gin.Context, exclude map[string]bool, requestedModel string
 }
 
 // canOrphanPassthrough reports whether an fc-id orphan can be safely routed
-// as a fresh request. Pool mode: at least one enabled, non-blocked,
-// worker-enabled, non-excluded account must exist. Single-account mode: the
-// caller's specific account must have a WorkerURL and support the model.
-// Returns false when no worker-capable target is reachable — in which case
-// we fall back to emitting 410 because direct-mode Responses upstream would
-// reject the cross-relay call_ids.
+// as a fresh request. When RESPONSES_ORPHAN_TRANSLATE=on, direct-mode accounts
+// are also recoverable because the gateway can translate orphan Responses
+// turns in-process and proxy the translated request upstream without relying
+// on a per-account sidecar worker. When orphan translation is off, we still
+// require a worker-capable target because raw /v1/responses passthrough would
+// session-reject the foreign call_ids.
 func canOrphanPassthrough(c *gin.Context, requestedModel string, exclude map[string]bool) bool {
+	requireWorker := config.ResponsesOrphanTranslate() != "on"
 	isPool, _ := c.Get("isPool")
 	if isPool == true {
 		accounts, err := store.GetEnabledAccounts()
@@ -550,7 +551,7 @@ func canOrphanPassthrough(c *gin.Context, requestedModel string, exclude map[str
 		}
 		blocked := store.GetBlockedAccountIDs(requestedModel)
 		for _, a := range accounts {
-			if strings.TrimSpace(a.WorkerURL) == "" {
+			if requireWorker && strings.TrimSpace(a.WorkerURL) == "" {
 				continue
 			}
 			if exclude[a.ID] || blocked[a.ID] {
@@ -572,7 +573,10 @@ func canOrphanPassthrough(c *gin.Context, requestedModel string, exclude map[str
 		return false
 	}
 	acct, err := store.GetAccount(aid)
-	if err != nil || acct == nil || strings.TrimSpace(acct.WorkerURL) == "" {
+	if err != nil || acct == nil {
+		return false
+	}
+	if requireWorker && strings.TrimSpace(acct.WorkerURL) == "" {
 		return false
 	}
 	if store.IsModelBlocked(aid, requestedModel) {
@@ -642,14 +646,68 @@ func orphanTranslateMessagesModel(model string) bool {
 	return false
 }
 
-func orphanTranslateRouteForModel(model string) string {
+type orphanTranslateRoute string
+
+const (
+	orphanTranslateRouteNone     orphanTranslateRoute = ""
+	orphanTranslateRouteChat     orphanTranslateRoute = "chat"
+	orphanTranslateRouteMessages orphanTranslateRoute = "messages"
+)
+
+func (r orphanTranslateRoute) logName() string {
+	if r == "" {
+		return "none"
+	}
+	return string(r)
+}
+
+func (r orphanTranslateRoute) modeName() string {
+	switch r {
+	case orphanTranslateRouteChat:
+		return "orphan_translate"
+	case orphanTranslateRouteMessages:
+		return "orphan_translate_messages"
+	default:
+		return "direct"
+	}
+}
+
+func orphanTranslateRouteForModel(model string) orphanTranslateRoute {
 	switch {
 	case orphanTranslateMessagesModel(model):
-		return "messages"
+		return orphanTranslateRouteMessages
 	case orphanTranslateCompatibleModel(model):
-		return "chat"
+		return orphanTranslateRouteChat
 	default:
-		return ""
+		return orphanTranslateRouteNone
+	}
+}
+
+type continuationRecoveryState struct {
+	Route       orphanTranslateRoute
+	Reason      string
+	FromAccount string
+}
+
+func (s continuationRecoveryState) armed() bool {
+	return s.Route != orphanTranslateRouteNone
+}
+
+func resolveOrphanRecoveryState(c *gin.Context, requestedModel string, exclude map[string]bool, reason string, fromAccount string) continuationRecoveryState {
+	if config.OrphanPassthrough() == "off" || config.ResponsesOrphanTranslate() != "on" {
+		return continuationRecoveryState{}
+	}
+	if !canOrphanPassthrough(c, requestedModel, exclude) {
+		return continuationRecoveryState{}
+	}
+	route := orphanTranslateRouteForModel(requestedModel)
+	if route == orphanTranslateRouteNone {
+		return continuationRecoveryState{}
+	}
+	return continuationRecoveryState{
+		Route:       route,
+		Reason:      reason,
+		FromAccount: fromAccount,
 	}
 }
 
@@ -1167,9 +1225,9 @@ func resolveContinuationBinding(previousResponseID string, functionCallOutputIDs
 		}
 	default: // SessionOrphan
 		return continuationBindingResult{
-			Kind:     continuationBindingOrphan,
-			Reason:   fmt.Sprintf("no function_call_output call_id matches any known session (hits=0 misses=%d)", session.MissCount),
-			HitCount: 0,
+			Kind:      continuationBindingOrphan,
+			Reason:    fmt.Sprintf("no function_call_output call_id matches any known session (hits=0 misses=%d)", session.MissCount),
+			HitCount:  0,
 			MissCount: session.MissCount,
 		}
 	}
@@ -1270,23 +1328,17 @@ func proxyResponses(c *gin.Context) {
 	refreshedOnAccount := make(map[string]bool)
 	crossAccountRollover := false
 	orphanDegraded := false
-	// orphanTranslate: when true, the orphan branch below selected the
-	// in-process Responses→chat/completions translator route (gated by
-	// config.ResponsesOrphanTranslate() and the account having a WorkerURL).
-	// The invoke selection below picks DoOrphanTranslateResponsesProxy in
-	// that case so the orphan turn bypasses stateful /v1/responses upstream.
-	orphanTranslate := false
-	// orphanTranslateMessages: like orphanTranslate but routes to the
-	// Responses→/v1/messages translator (Anthropic-compat). Used for the
-	// gpt-5 family and Claude models, which Copilot's /v1/chat/completions
-	// rejects with "Please use /v1/responses or /v1/messages".
-	orphanTranslateMessages := false
-	// pinnedAccount, when non-nil, forces the next iteration to reuse the same account
-	// without consulting sticky caches or the pool. Used after a successful force-refresh
-	// so the refreshed token is actually exercised on the account that minted it, rather
-	// than re-running resolveState (which, on a fallback_round_robin path, would pick a
-	// different account and waste the refresh).
+	// recovery records the explicit broken-continuation recovery route. Normal
+	// requests use ordinary pool routing; valid continuations use canonical
+	// sticky routing; only split/orphan/upstream-rejected continuations arm
+	// this state and switch to the stateless flatten route.
+	recovery := continuationRecoveryState{}
+	// pinnedAccount, when non-nil, forces the next iteration to reuse a known
+	// account without consulting sticky caches or the pool. Successful token
+	// refreshes and canonical replay-invalid recovery both use this, with
+	// pinnedAccountKind keeping the log semantics explicit.
 	var pinnedAccount *resolvedAccount
+	pinnedAccountKind := ""
 	// attemptLimit starts at maxAttempts. Each successful force-refresh that pins a retry
 	// grants one bonus slot so the pinned retry does not cannibalize the cross-account
 	// rollover budget. Without this, a pool where A orphan-degrades and B persistently
@@ -1355,31 +1407,13 @@ func proxyResponses(c *gin.Context) {
 			// = sole owner account is blocked/stopped. Because the flatten
 			// path drops all tool_call_ids (history → prose), neither case
 			// depends on any specific account owning the ids — we can clear
-			// continuation state and re-dispatch to any worker-capable
-			// account in the pool. Falls back to the original typed error
+			// continuation state and dispatch to an available account through
+			// the stateless recovery route. Falls back to the original typed error
 			// (409/503) when flatten isn't armable.
-			armed := ""
-			if config.OrphanPassthrough() != "off" &&
-				config.ResponsesOrphanTranslate() == "on" &&
-				len(functionCallOutputIDs) > 0 &&
-				canOrphanPassthrough(c, requestedModel, exclude) {
-				switch {
-				case orphanTranslateMessagesModel(requestedModel):
-					orphanTranslateMessages = true
-					armed = "messages"
-				case orphanTranslateCompatibleModel(requestedModel):
-					orphanTranslate = true
-					armed = "chat"
-				}
-			}
-			if armed != "" {
-				if isPool == true {
-					for _, id := range workerDisabledAccountIDs(requestedModel) {
-						exclude[id] = true
-					}
-				}
-				log.Printf("[responses rid=%s] binding_kind=%d recovery: armed orphan_translate route=%s hits=%d misses=%d fc_ids=%d accounts=%v reason=%q",
-					reqID, binding.Kind, armed, binding.HitCount, binding.MissCount, len(functionCallOutputIDs), binding.SplitAccounts, binding.Reason)
+			recovery = resolveOrphanRecoveryState(c, requestedModel, exclude, binding.Reason, binding.AccountID)
+			if recovery.armed() && len(functionCallOutputIDs) > 0 {
+				log.Printf("[responses rid=%s] recovery armed binding_kind=%d recovery_route=%s recovery_from_account=%q hits=%d misses=%d fc_ids=%d accounts=%v reason=%q",
+					reqID, binding.Kind, recovery.Route.logName(), recovery.FromAccount, binding.HitCount, binding.MissCount, len(functionCallOutputIDs), binding.SplitAccounts, binding.Reason)
 				previousResponseID = ""
 				functionCallOutputIDs = nil
 				continuationRequested = false
@@ -1392,9 +1426,9 @@ func proxyResponses(c *gin.Context) {
 			// when the orphan is a function_call_output orphan (input is
 			// self-contained, history is present in full), worker mode is
 			// available, and no degrade opt-in was requested, clear sticky
-			// state and route fresh. Worker translates to stateless chat/
-			// completions upstream so tool_call_ids don't need to match any
-			// server-side session record.
+			// state and route fresh. With RESPONSES_ORPHAN_TRANSLATE=on, the
+			// gateway uses the stateless flatten route; otherwise only
+			// worker-enabled accounts are eligible for legacy passthrough.
 			//
 			// Skipped for prev_response_id-only orphans because that case's
 			// input is truncated and depends on server-side history — we
@@ -1406,33 +1440,25 @@ func proxyResponses(c *gin.Context) {
 				// pool-routing path below only picks worker-enabled ones.
 				// Direct-mode accounts would hit the Responses endpoint
 				// which IS session-stateful and would reject the orphan.
-				if isPool == true {
+				if isPool == true && config.ResponsesOrphanTranslate() != "on" {
 					for _, id := range workerDisabledAccountIDs(requestedModel) {
 						exclude[id] = true
 					}
 				}
-				log.Printf("[responses rid=%s] orphan_passthrough pre-loop: hits=%d misses=%d fc_ids=%d — clearing continuation and routing via worker pool",
+				log.Printf("[responses rid=%s] orphan_passthrough pre-loop: hits=%d misses=%d fc_ids=%d — clearing continuation and routing fresh",
 					reqID, binding.HitCount, binding.MissCount, len(functionCallOutputIDs))
 				previousResponseID = ""
 				functionCallOutputIDs = nil
 				continuationRequested = false
 				// When orphan-translate mode is armed, the invoke selection
-				// below picks DoOrphanTranslateResponsesProxy so the fresh
-				// routing lands on the worker's stateless chat/completions
-				// instead of its stateful /v1/responses (which proxies to
-				// Copilot's session-validating /v1/responses and would 401
-				// on cross-relay fc_ids).
-				if config.ResponsesOrphanTranslate() == "on" {
-					switch {
-					case orphanTranslateCompatibleModel(requestedModel):
-						orphanTranslate = true
-						log.Printf("[responses rid=%s] orphan_translate armed for this request (chat-completions route, model=%q)", reqID, requestedModel)
-					case orphanTranslateMessagesModel(requestedModel):
-						orphanTranslateMessages = true
-						log.Printf("[responses rid=%s] orphan_translate armed for this request (messages route, model=%q)", reqID, requestedModel)
-					default:
-						log.Printf("[responses rid=%s] orphan_translate skipped for model=%q — no compatible route, falling through to orphan_passthrough", reqID, requestedModel)
-					}
+				// below picks a stateless flatten route instead of the
+				// stateful /v1/responses upstream.
+				recovery = resolveOrphanRecoveryState(c, requestedModel, exclude, binding.Reason, "")
+				if recovery.armed() {
+					log.Printf("[responses rid=%s] recovery armed binding_kind=%d recovery_route=%s recovery_from_account=%q model=%q reason=%q",
+						reqID, binding.Kind, recovery.Route.logName(), recovery.FromAccount, requestedModel, recovery.Reason)
+				} else if config.ResponsesOrphanTranslate() == "on" {
+					log.Printf("[responses rid=%s] orphan_translate skipped for model=%q; no compatible recovery route, falling through to orphan_passthrough", reqID, requestedModel)
 				}
 				// bodyBytes unchanged: input carries the full self-contained
 				// history including structured tool-use items.
@@ -1464,8 +1490,12 @@ func proxyResponses(c *gin.Context) {
 		stickyKind := "none"
 		if pinnedAccount != nil {
 			resolved = pinnedAccount
-			stickyKind = "pinned_refresh_retry"
+			stickyKind = pinnedAccountKind
+			if stickyKind == "" {
+				stickyKind = "pinned_retry"
+			}
 			pinnedAccount = nil
+			pinnedAccountKind = ""
 		} else if continuationPinned != nil {
 			resolved = continuationPinned
 			stickyKind = "session_binding_canonical"
@@ -1483,8 +1513,9 @@ func proxyResponses(c *gin.Context) {
 			return
 		}
 
-		log.Printf("[responses rid=%s attempt=%d] resolved account=%s sticky_kind=%s fell_back=%v cross_rollover=%v exclude=%v",
-			reqID, attempt, resolved.AccountID, stickyKind, fellBackToPool, crossAccountRollover, exclude)
+		log.Printf("[responses rid=%s attempt=%d] resolved account=%s sticky_kind=%s fell_back=%v cross_rollover=%v exclude=%v recovery_route=%s recovery_from_account=%q recovery_to_account=%q recovery_reason=%q",
+			reqID, attempt, resolved.AccountID, stickyKind, fellBackToPool, crossAccountRollover, exclude,
+			recovery.Route.logName(), recovery.FromAccount, resolved.AccountID, recovery.Reason)
 
 		if !checkRateLimit(c, resolved.AccountID) {
 			log.Printf("[responses rid=%s attempt=%d] rate limited on account=%s", reqID, attempt, resolved.AccountID)
@@ -1516,26 +1547,16 @@ func proxyResponses(c *gin.Context) {
 				modeName = "detached_same"
 			}
 		}
-		// orphan_translate overrides the mode selection: it only kicks in on
-		// the pre-loop orphan branch, which has already cleared continuation
-		// state, so the detached-continuation modes above don't apply.
-		// Needs a WorkerURL on the resolved account — fall back silently to
-		// direct mode if the pool surfaced a non-worker account.
-		if orphanTranslate {
-			if acct, _ := store.GetAccount(resolved.AccountID); acct != nil && strings.TrimSpace(acct.WorkerURL) != "" {
-				invoke = instance.DoOrphanTranslateResponsesProxy
-				modeName = "orphan_translate"
-			} else {
-				log.Printf("[responses rid=%s attempt=%d] orphan_translate armed but account=%s has no WorkerURL — direct", reqID, attempt, resolved.AccountID)
-			}
+		// Recovery routing overrides direct/detached mode only after the
+		// continuation state has been cleared. That keeps normal account
+		// binding separate from the stateless flatten retry.
+		if recovery.Route == orphanTranslateRouteChat {
+			invoke = instance.DoOrphanTranslateResponsesProxy
+			modeName = recovery.Route.modeName()
 		}
-		if orphanTranslateMessages {
-			if acct, _ := store.GetAccount(resolved.AccountID); acct != nil && strings.TrimSpace(acct.WorkerURL) != "" {
-				invoke = instance.DoOrphanTranslateMessagesProxy
-				modeName = "orphan_translate_messages"
-			} else {
-				log.Printf("[responses rid=%s attempt=%d] orphan_translate_messages armed but account=%s has no WorkerURL — direct", reqID, attempt, resolved.AccountID)
-			}
+		if recovery.Route == orphanTranslateRouteMessages {
+			invoke = instance.DoOrphanTranslateMessagesProxy
+			modeName = recovery.Route.modeName()
 		}
 		log.Printf("[responses rid=%s attempt=%d] mode=%s can_detach=%v account=%s",
 			reqID, attempt, modeName, continuationCanDetach, resolved.AccountID)
@@ -1622,24 +1643,22 @@ func proxyResponses(c *gin.Context) {
 				// the translator is the canonical flatten-and-retry mechanism
 				// and already runs on orphan-bound traffic today. Guarded by
 				// orphanDegraded so a single request degrades at most once.
-				if !orphanDegraded && attempt < attemptLimit-1 && config.ResponsesOrphanTranslate() == "on" {
-					armed := orphanTranslateRouteForModel(requestedModel)
-					switch armed {
-					case "messages":
-						orphanTranslateMessages = true
-					case "chat":
-						orphanTranslate = true
-					}
-					if armed != "" {
+				if !orphanDegraded {
+					recovery = resolveOrphanRecoveryState(c, requestedModel, exclude, "canonical upstream rejected continuation", resolved.AccountID)
+					if recovery.armed() {
 						orphanDegraded = true
-						exclude[resolved.AccountID] = true
+						if attempt >= attemptLimit-1 {
+							attemptLimit++
+						}
 						previousResponseID = ""
 						functionCallOutputIDs = nil
 						continuationRequested = false
 						continuationPinned = nil
 						crossAccountRollover = false
-						log.Printf("[responses rid=%s attempt=%d] replay-invalid on account=%s mode=%s, re-dispatching via orphan_translate route=%s; detail=%q",
-							reqID, attempt, resolved.AccountID, modeName, armed, truncateForLog(detail, 240))
+						pinnedAccount = resolved
+						pinnedAccountKind = "recovery_same_account"
+						log.Printf("[responses rid=%s attempt=%d] recovery armed after replay-invalid recovery_from_account=%q recovery_to_account=%q recovery_route=%s previous_mode=%s detail=%q",
+							reqID, attempt, resolved.AccountID, resolved.AccountID, recovery.Route.logName(), modeName, truncateForLog(detail, 240))
 						continue
 					}
 				}
@@ -1695,6 +1714,7 @@ func proxyResponses(c *gin.Context) {
 				continue
 			}
 			pinnedAccount = resolved
+			pinnedAccountKind = "pinned_refresh_retry"
 			attemptLimit++
 			log.Printf("[responses rid=%s attempt=%d] 401 on account=%s: forced token refresh ok, pinning retry to same account (attemptLimit=%d)", reqID, attempt, resolved.AccountID, attemptLimit)
 			continue
