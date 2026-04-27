@@ -14,6 +14,12 @@ GRAY_UNIT_NAME="${GRAY_UNIT_NAME:-copilot-go-gray.service}"
 GRAY_PROXY_PORT="${GRAY_PROXY_PORT:-39100}"
 GRAY_WEB_PORT="${GRAY_WEB_PORT:-39101}"
 GRAY_WORKER_PORT_RANGE="${GRAY_WORKER_PORT_RANGE:-9390-9399}"
+GRAY_WORKER_EXE="${GRAY_WORKER_EXE:-__disabled__}"
+GRAY_WORKER_ARGS="${GRAY_WORKER_ARGS:-}"
+GRAY_USE_WORKER_POOL="${GRAY_USE_WORKER_POOL:-off}"
+GRAY_WORKER_AUTO_ADOPT="${GRAY_WORKER_AUTO_ADOPT:-}"
+GRAY_WORKER_MIGRATE_LEGACY="${GRAY_WORKER_MIGRATE_LEGACY:-}"
+GRAY_READY_RETRIES="${GRAY_READY_RETRIES:-90}"
 TAG="${TAG:-$(date +%Y%m%d%H%M%S)}"
 SKIP_LOCAL_CHECKS="${SKIP_LOCAL_CHECKS:-0}"
 
@@ -41,6 +47,12 @@ ssh "${REMOTE}" bash -s -- \
   "${GRAY_PROXY_PORT}" \
   "${GRAY_WEB_PORT}" \
   "${GRAY_WORKER_PORT_RANGE}" \
+  "${GRAY_WORKER_EXE}" \
+  "${GRAY_WORKER_ARGS}" \
+  "${GRAY_USE_WORKER_POOL}" \
+  "${GRAY_WORKER_AUTO_ADOPT}" \
+  "${GRAY_WORKER_MIGRATE_LEGACY}" \
+  "${GRAY_READY_RETRIES}" \
   "${TAG}" <<'EOF'
 set -euo pipefail
 
@@ -53,7 +65,13 @@ gray_unit_name="$6"
 gray_proxy_port="$7"
 gray_web_port="$8"
 gray_worker_port_range="$9"
-tag="${10}"
+gray_worker_exe="${10}"
+gray_worker_args="${11}"
+gray_use_worker_pool="${12}"
+gray_worker_auto_adopt="${13}"
+gray_worker_migrate_legacy="${14}"
+gray_ready_retries="${15}"
+tag="${16}"
 
 tmp_binary="/tmp/copilot-go-gray-${tag}"
 live_app_dir="${HOME}/.local/share/copilot-api"
@@ -95,19 +113,31 @@ systemctl --user reset-failed "${gray_unit_name}" 2>/dev/null || true
 assert_port_free "${gray_proxy_port}" "proxy"
 assert_port_free "${gray_web_port}" "web"
 
-systemd-run --user --unit "${gray_unit_name}" \
-  --property=WorkingDirectory="${gray_runtime_dir}" \
-  --property=Restart=on-failure \
-  --property=RestartSec=3 \
-  --property=Environment="COPILOT_API_APP_DIR=${gray_app_dir}" \
-  --property=Environment="COPILOT_WORKERS_HOME=${gray_workers_root}" \
-  --property=Environment="COPILOT_WORKER_PORT_RANGE=${gray_worker_port_range}" \
-  --property=Environment="COPILOT_WORKER_EXE=__disabled__" \
-  --property=Environment="USE_WORKER_POOL=off" \
-  --property=Environment="RESPONSES_ORPHAN_TRANSLATE=on" \
-  "${gray_binary_path}" --web-port "${gray_web_port}" --proxy-port "${gray_proxy_port}" >/dev/null
+cmd=(
+  systemd-run --user --unit "${gray_unit_name}"
+  --property=WorkingDirectory="${gray_runtime_dir}"
+  --property=Restart=on-failure
+  --property=RestartSec=3
+  --property=Environment="COPILOT_API_APP_DIR=${gray_app_dir}"
+  --property=Environment="COPILOT_WORKERS_HOME=${gray_workers_root}"
+  --property=Environment="COPILOT_WORKER_PORT_RANGE=${gray_worker_port_range}"
+  --property=Environment="COPILOT_WORKER_EXE=${gray_worker_exe}"
+  --property=Environment="USE_WORKER_POOL=${gray_use_worker_pool}"
+  --property=Environment="RESPONSES_ORPHAN_TRANSLATE=on"
+)
+if [[ -n "${gray_worker_args}" ]]; then
+  cmd+=(--property=Environment="COPILOT_WORKER_ARGS=${gray_worker_args}")
+fi
+if [[ -n "${gray_worker_auto_adopt}" ]]; then
+  cmd+=(--property=Environment="COPILOT_WORKER_AUTO_ADOPT=${gray_worker_auto_adopt}")
+fi
+if [[ -n "${gray_worker_migrate_legacy}" ]]; then
+  cmd+=(--property=Environment="COPILOT_WORKER_MIGRATE_LEGACY=${gray_worker_migrate_legacy}")
+fi
+cmd+=("${gray_binary_path}" --web-port "${gray_web_port}" --proxy-port "${gray_proxy_port}")
+"${cmd[@]}" >/dev/null
 
-for _ in $(seq 1 30); do
+for _ in $(seq 1 "${gray_ready_retries}"); do
   if gray_ready; then
     systemctl --user is-active "${gray_unit_name}" >/dev/null
     ss -ltnp 2>/dev/null | grep -E ":${gray_proxy_port}\b|:${gray_web_port}\b" >/dev/null

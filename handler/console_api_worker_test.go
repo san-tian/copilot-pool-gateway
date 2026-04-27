@@ -1,10 +1,14 @@
 package handler
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
 	"testing"
+	"time"
 
 	"copilot-go/instance"
 	"copilot-go/store"
@@ -125,5 +129,59 @@ func TestHandleDeleteAccount_NilSupervisorStillDeletes(t *testing.T) {
 	}
 	if got != nil {
 		t.Fatalf("account not deleted: %+v", got)
+	}
+}
+
+func TestHandleAddAccount_AutoAdoptsWorkerWhenSupervisorEnabled(t *testing.T) {
+	clearDefaultSupervisor(t)
+	setupAccountsEnv(t)
+
+	sup, err := instance.NewSupervisor(instance.SupervisorOptions{
+		PortRangeStart: 55340,
+		PortRangeEnd:   55349,
+		WorkersRoot:    t.TempDir(),
+		ReadyTimeout:   2 * time.Second,
+		CommandFactory: func(_ string, _ int, _ string) *exec.Cmd {
+			return exec.Command("sleep", "30")
+		},
+		ReadinessProbe: func(ctx context.Context, port int) error { return nil },
+		PersistOnReady: func(entry instance.WorkerEntry) error {
+			return store.UpdateAccountWorker(entry.AccountID, entry.WorkerURL, entry.Home, entry.Port, entry.PID)
+		},
+		PersistOnStop: store.ClearAccountWorker,
+	})
+	if err != nil {
+		t.Fatalf("NewSupervisor: %v", err)
+	}
+	instance.SetDefaultSupervisor(sup)
+	t.Cleanup(func() { sup.Shutdown(context.Background()) })
+
+	body := []byte(`{"name":"worker-new","githubToken":"tok-new","accountType":"individual"}`)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/accounts", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handleAddAccount(c)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body = %s", rec.Code, rec.Body.String())
+	}
+	var got store.Account
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("Unmarshal response: %v; body=%s", err, rec.Body.String())
+	}
+	if !got.WorkerManaged {
+		t.Fatalf("WorkerManaged = false: %+v", got)
+	}
+	if got.WorkerURL == "" || got.WorkerPort == 0 || got.WorkerPID == 0 {
+		t.Fatalf("missing worker fields after auto-adopt: %+v", got)
+	}
+	stored, err := store.GetAccount(got.ID)
+	if err != nil || stored == nil {
+		t.Fatalf("GetAccount: %v, %v", stored, err)
+	}
+	if !stored.WorkerManaged || stored.WorkerURL == "" {
+		t.Fatalf("stored account not updated: %+v", stored)
 	}
 }

@@ -496,6 +496,42 @@ func (s *WorkerSupervisor) RecoverFromStore(ctx context.Context) {
 	}
 }
 
+// MigrateLegacyAccounts promotes enabled legacy accounts (`WorkerManaged=false`)
+// onto supervisor-owned workers. This is an opt-in startup migration for
+// environments that previously relied on direct mode or externally managed
+// workerUrl values. Existing manual worker processes are not touched here; the
+// account's persisted WorkerURL simply flips to the new supervised worker once
+// the readiness probe passes.
+func (s *WorkerSupervisor) MigrateLegacyAccounts(ctx context.Context) {
+	accounts, err := store.GetEnabledAccounts()
+	if err != nil {
+		log.Printf("supervisor: migrate legacy load accounts: %v", err)
+		return
+	}
+	for _, account := range accounts {
+		if account.WorkerManaged {
+			continue
+		}
+		token := strings.TrimSpace(account.GithubToken)
+		if token == "" {
+			log.Printf("supervisor: migrate legacy skip account=%s missing github token", account.ID)
+			continue
+		}
+		legacyWorkerURL := strings.TrimSpace(account.WorkerURL)
+		if legacyWorkerURL != "" {
+			log.Printf("supervisor: migrate legacy account=%s replacing manual worker_url=%s", account.ID, legacyWorkerURL)
+		} else {
+			log.Printf("supervisor: migrate legacy account=%s from direct mode", account.ID)
+		}
+		if _, err := s.spawn(ctx, account.ID, token, 0); err != nil {
+			if errors.Is(err, ErrAccountAlreadyLive) {
+				continue
+			}
+			log.Printf("supervisor: migrate legacy account=%s: %v", account.ID, err)
+		}
+	}
+}
+
 func (s *WorkerSupervisor) tryAdopt(ctx context.Context, account store.Account) (bool, error) {
 	if account.WorkerPort <= 0 || account.WorkerPID <= 0 {
 		return false, nil

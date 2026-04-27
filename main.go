@@ -200,6 +200,9 @@ func main() {
 	if sup := initWorkerSupervisor(); sup != nil {
 		instance.SetDefaultSupervisor(sup)
 		sup.RecoverFromStore(ctx)
+		if config.WorkerMigrateLegacy() {
+			sup.MigrateLegacyAccounts(ctx)
+		}
 		go sup.HealthLoop(ctx)
 	}
 

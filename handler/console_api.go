@@ -327,6 +327,7 @@ func handleAddAccount(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	account = adoptManagedWorkerForAccount(context.Background(), account, body.GithubToken)
 	c.JSON(http.StatusCreated, account)
 }
 

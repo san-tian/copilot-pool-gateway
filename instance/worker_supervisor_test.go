@@ -490,6 +490,66 @@ func TestSupervisor_HealthLoopRestartsCrashedWorker(t *testing.T) {
 	t.Fatalf("worker was not restarted, last state: %+v", got)
 }
 
+func TestSupervisor_MigrateLegacyAccountsPromotesEnabledAccounts(t *testing.T) {
+	seedSupervisorAccountsEnv(t)
+	acctA, err := store.AddAccount("legacy-direct", "tok-a", "")
+	if err != nil {
+		t.Fatalf("AddAccount acctA: %v", err)
+	}
+	acctB, err := store.AddAccount("legacy-workerurl", "tok-b", "")
+	if err != nil {
+		t.Fatalf("AddAccount acctB: %v", err)
+	}
+	if _, err := store.UpdateAccount(acctB.ID, map[string]interface{}{"workerUrl": "http://127.0.0.1:39001"}); err != nil {
+		t.Fatalf("UpdateAccount acctB workerUrl: %v", err)
+	}
+	acctC, err := store.AddAccount("missing-token", "", "")
+	if err != nil {
+		t.Fatalf("AddAccount acctC: %v", err)
+	}
+
+	root := t.TempDir()
+	sup, err := NewSupervisor(SupervisorOptions{
+		PortRangeStart: 55330,
+		PortRangeEnd:   55339,
+		WorkersRoot:    root,
+		ReadyTimeout:   2 * time.Second,
+		CommandFactory: func(_ string, _ int, _ string) *exec.Cmd {
+			return exec.Command("sleep", "30")
+		},
+		ReadinessProbe: func(ctx context.Context, port int) error { return nil },
+		PersistOnReady: func(entry WorkerEntry) error {
+			return store.UpdateAccountWorker(entry.AccountID, entry.WorkerURL, entry.Home, entry.Port, entry.PID)
+		},
+		PersistOnStop: store.ClearAccountWorker,
+	})
+	if err != nil {
+		t.Fatalf("NewSupervisor: %v", err)
+	}
+	t.Cleanup(func() { sup.Shutdown(context.Background()) })
+
+	sup.MigrateLegacyAccounts(context.Background())
+
+	gotA, _ := store.GetAccount(acctA.ID)
+	if gotA == nil || !gotA.WorkerManaged || strings.TrimSpace(gotA.WorkerURL) == "" {
+		t.Fatalf("acctA not migrated: %+v", gotA)
+	}
+	gotB, _ := store.GetAccount(acctB.ID)
+	if gotB == nil || !gotB.WorkerManaged || strings.TrimSpace(gotB.WorkerURL) == "" {
+		t.Fatalf("acctB not migrated: %+v", gotB)
+	}
+	if gotB.WorkerURL == "http://127.0.0.1:39001" {
+		t.Fatalf("acctB kept legacy workerUrl instead of supervised worker: %+v", gotB)
+	}
+	gotC, _ := store.GetAccount(acctC.ID)
+	if gotC == nil {
+		t.Fatalf("acctC missing after migrate")
+	}
+	if gotC.WorkerManaged || strings.TrimSpace(gotC.WorkerURL) != "" {
+		t.Fatalf("acctC should stay unmanaged without token: %+v", gotC)
+	}
+}
+
 // ─── Default readiness probe ───────────────────────────────────────────────
 
 func TestHttpModelsReady_Accepts2xx(t *testing.T) {

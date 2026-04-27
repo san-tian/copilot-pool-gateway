@@ -134,18 +134,34 @@ func WorkerAutoAdopt() bool {
 	return true
 }
 
+// WorkerMigrateLegacy controls whether gateway startup should migrate enabled
+// legacy accounts (`WorkerManaged=false`) onto supervisor-owned workers.
+// Default off: older deployments may intentionally keep manual/external worker
+// lifecycle. When on, startup spawns a managed worker for every enabled legacy
+// account that still has a github token, overwriting any old manual workerUrl.
+func WorkerMigrateLegacy() bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv("COPILOT_WORKER_MIGRATE_LEGACY")))
+	if v == "on" || v == "enabled" || v == "1" || v == "true" {
+		return true
+	}
+	return false
+}
+
 // OrphanPassthrough controls what happens when a /v1/responses request arrives
 // with function_call_output items whose call_ids the router's sticky cache
 // has never seen (the cross-relay migration scenario).
 //
 // "auto" (default) — when a worker-enabled account is available, skip the
-//   410 session_expired check, clear sticky state, and pool-route the request
-//   as a fresh session. Worker translates to stateless chat/completions so
-//   tool_call_ids don't have to match any server-side session. Only kicks in
-//   for fc_id orphans; previous_response_id-only orphans (truncated input
-//   depending on server-side history) still 410 because input is unrecoverable.
+//
+//	410 session_expired check, clear sticky state, and pool-route the request
+//	as a fresh session. Worker translates to stateless chat/completions so
+//	tool_call_ids don't have to match any server-side session. Only kicks in
+//	for fc_id orphans; previous_response_id-only orphans (truncated input
+//	depending on server-side history) still 410 because input is unrecoverable.
+//
 // "off" — preserve historical behavior: 410 on any orphan, unless the client
-//   set X-Copilot-Continuation-Degrade: orphan.
+//
+//	set X-Copilot-Continuation-Degrade: orphan.
 func OrphanPassthrough() string {
 	v := strings.TrimSpace(strings.ToLower(os.Getenv("ORPHAN_PASSTHROUGH")))
 	if v == "off" || v == "disabled" || v == "0" || v == "false" {
@@ -163,11 +179,14 @@ func OrphanPassthrough() string {
 // orphan fc_ids pass through cleanly.
 //
 // "on" — translate orphan /v1/responses → chat/completions in Go before
-//        the worker call; wrap the chat SSE reply back into Responses SSE.
-//        Only effective when the selected account has a WorkerURL.
+//
+//	the worker call; wrap the chat SSE reply back into Responses SSE.
+//	Only effective when the selected account has a WorkerURL.
+//
 // "off" (default) — orphan passthrough forwards the raw Responses payload
-//                   to the worker's /v1/responses, which proxies to Copilot
-//                   and can 401 on unknown fc_ids.
+//
+//	to the worker's /v1/responses, which proxies to Copilot
+//	and can 401 on unknown fc_ids.
 func ResponsesOrphanTranslate() string {
 	v := strings.TrimSpace(strings.ToLower(os.Getenv("RESPONSES_ORPHAN_TRANSLATE")))
 	if v == "on" || v == "enabled" || v == "1" || v == "true" {

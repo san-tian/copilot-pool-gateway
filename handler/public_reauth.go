@@ -85,22 +85,10 @@ func completeSessionToAccount(sessionID, name, existingAccountID string) (*authC
 	auth.CleanupSession(sessionID)
 	instance.StopInstance(account.ID)
 
-	// Phase 0c: auto-adopt worker via supervisor when configured. Fail-soft —
+	// Phase 0c+: auto-adopt worker via supervisor when configured. Fail-soft —
 	// any supervisor error is logged but does not block device-flow completion.
 	// The account remains usable via the direct /v1/responses path.
-	if sup := instance.DefaultSupervisor(); sup != nil && config.WorkerAutoAdopt() {
-		ctx := context.Background()
-		if err := sup.RemoveAndCleanup(ctx, account.ID); err != nil {
-			log.Printf("supervisor: remove-and-cleanup %s: %v", account.ID, err)
-		}
-		if _, err := sup.Spawn(ctx, account.ID, session.AccessToken); err != nil {
-			log.Printf("supervisor: spawn %s: %v (falling through to direct mode)", account.ID, err)
-		} else if fresh, freshErr := store.GetAccount(account.ID); freshErr == nil && fresh != nil {
-			// Spawn's PersistOnReady wrote WorkerURL/WorkerHome/etc back to
-			// store; refresh in-memory copy so ReconcileAccount sees it.
-			account = fresh
-		}
-	}
+	account = adoptManagedWorkerForAccount(context.Background(), account, session.AccessToken)
 
 	updated, probe, err := instance.ReconcileAccount(*account)
 	if err != nil {
