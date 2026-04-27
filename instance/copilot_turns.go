@@ -1,6 +1,7 @@
 package instance
 
 import (
+	"log"
 	"net/http"
 	"sort"
 	"strings"
@@ -247,12 +248,28 @@ func storeResponseTurnContext(accountID string, responseID string, ctx copilotTu
 	}
 	ensureDurableContinuationStateLoaded()
 	storeCopilotTurnCacheEntry(&responseTurnCache.mu, responseTurnCache.entries, responseID, accountID, ctx)
+	if continuationMetadataEnabled() {
+		storeContinuationBinding(continuationBindingResponse, responseID, accountID, ctx)
+		return
+	}
 	persistDurableContinuationState()
 }
 
 func loadResponseTurnContext(accountID string, responseID string) (copilotTurnContext, bool) {
 	ensureDurableContinuationStateLoaded()
-	return loadCopilotTurnCacheEntry(&responseTurnCache.mu, responseTurnCache.entries, responseID, accountID)
+	if ctx, ok := loadCopilotTurnCacheEntry(&responseTurnCache.mu, responseTurnCache.entries, responseID, accountID); ok {
+		return ctx, true
+	}
+	if !continuationMetadataEnabled() {
+		return copilotTurnContext{}, false
+	}
+	rec, ok := lookupContinuationBinding(continuationBindingResponse, responseID)
+	if !ok || rec.AccountID != strings.TrimSpace(accountID) {
+		return copilotTurnContext{}, false
+	}
+	ctx := bindingRecordContext(rec)
+	storeCopilotTurnCacheEntry(&responseTurnCache.mu, responseTurnCache.entries, responseID, accountID, ctx)
+	return ctx, true
 }
 
 func storeResponseFunctionCallTurnContext(accountID string, callIDs []string, ctx copilotTurnContext) {
@@ -263,8 +280,13 @@ func storeResponseFunctionCallTurnContext(accountID string, callIDs []string, ct
 	ensureDurableContinuationStateLoaded()
 	for _, callID := range callIDs {
 		storeCopilotTurnCacheEntry(&responseFunctionCallTurnCache.mu, responseFunctionCallTurnCache.entries, callID, accountID, ctx)
+		if continuationMetadataEnabled() {
+			storeContinuationBinding(continuationBindingFunctionCall, callID, accountID, ctx)
+		}
 	}
-	persistDurableContinuationState()
+	if !continuationMetadataEnabled() {
+		persistDurableContinuationState()
+	}
 }
 
 func loadResponseFunctionCallTurnContext(accountID string, callIDs []string) (copilotTurnContext, bool) {
@@ -273,6 +295,16 @@ func loadResponseFunctionCallTurnContext(accountID string, callIDs []string) (co
 		if ctx, ok := loadCopilotTurnCacheEntry(&responseFunctionCallTurnCache.mu, responseFunctionCallTurnCache.entries, callID, accountID); ok {
 			return ctx, true
 		}
+		if !continuationMetadataEnabled() {
+			continue
+		}
+		rec, ok := lookupContinuationBinding(continuationBindingFunctionCall, callID)
+		if !ok || rec.AccountID != strings.TrimSpace(accountID) {
+			continue
+		}
+		ctx := bindingRecordContext(rec)
+		storeCopilotTurnCacheEntry(&responseFunctionCallTurnCache.mu, responseFunctionCallTurnCache.entries, callID, accountID, ctx)
+		return ctx, true
 	}
 	return copilotTurnContext{}, false
 }
@@ -285,8 +317,13 @@ func storeMessageToolCallTurnContext(accountID string, toolCallIDs []string, ctx
 	ensureDurableContinuationStateLoaded()
 	for _, toolCallID := range toolCallIDs {
 		storeCopilotTurnCacheEntry(&messageToolCallTurnCache.mu, messageToolCallTurnCache.entries, toolCallID, accountID, ctx)
+		if continuationMetadataEnabled() {
+			storeContinuationBinding(continuationBindingToolUse, toolCallID, accountID, ctx)
+		}
 	}
-	persistDurableContinuationState()
+	if !continuationMetadataEnabled() {
+		persistDurableContinuationState()
+	}
 }
 
 func loadMessageToolCallTurnContext(accountID string, toolCallIDs []string) (copilotTurnContext, bool) {
@@ -295,6 +332,16 @@ func loadMessageToolCallTurnContext(accountID string, toolCallIDs []string) (cop
 		if ctx, ok := loadCopilotTurnCacheEntry(&messageToolCallTurnCache.mu, messageToolCallTurnCache.entries, toolCallID, accountID); ok {
 			return ctx, true
 		}
+		if !continuationMetadataEnabled() {
+			continue
+		}
+		rec, ok := lookupContinuationBinding(continuationBindingToolUse, toolCallID)
+		if !ok || rec.AccountID != strings.TrimSpace(accountID) {
+			continue
+		}
+		ctx := bindingRecordContext(rec)
+		storeCopilotTurnCacheEntry(&messageToolCallTurnCache.mu, messageToolCallTurnCache.entries, toolCallID, accountID, ctx)
+		return ctx, true
 	}
 	return copilotTurnContext{}, false
 }
@@ -305,13 +352,33 @@ func LookupMessageToolCallAccount(toolCallIDs []string) (string, bool) {
 		if accountID, ok := lookupCopilotTurnCacheAccount(&messageToolCallTurnCache.mu, messageToolCallTurnCache.entries, toolCallID); ok {
 			return accountID, true
 		}
+		if !continuationMetadataEnabled() {
+			continue
+		}
+		rec, ok := lookupContinuationBinding(continuationBindingToolUse, toolCallID)
+		if !ok {
+			continue
+		}
+		storeCopilotTurnCacheEntry(&messageToolCallTurnCache.mu, messageToolCallTurnCache.entries, toolCallID, rec.AccountID, bindingRecordContext(rec))
+		return rec.AccountID, true
 	}
 	return "", false
 }
 
 func LookupResponseTurnAccount(responseID string) (string, bool) {
 	ensureDurableContinuationStateLoaded()
-	return lookupCopilotTurnCacheAccount(&responseTurnCache.mu, responseTurnCache.entries, responseID)
+	if accountID, ok := lookupCopilotTurnCacheAccount(&responseTurnCache.mu, responseTurnCache.entries, responseID); ok {
+		return accountID, true
+	}
+	if !continuationMetadataEnabled() {
+		return "", false
+	}
+	rec, ok := lookupContinuationBinding(continuationBindingResponse, responseID)
+	if !ok {
+		return "", false
+	}
+	storeCopilotTurnCacheEntry(&responseTurnCache.mu, responseTurnCache.entries, responseID, rec.AccountID, bindingRecordContext(rec))
+	return rec.AccountID, true
 }
 
 func LookupResponseFunctionCallAccount(callIDs []string) (string, bool) {
@@ -320,6 +387,15 @@ func LookupResponseFunctionCallAccount(callIDs []string) (string, bool) {
 		if accountID, ok := lookupCopilotTurnCacheAccount(&responseFunctionCallTurnCache.mu, responseFunctionCallTurnCache.entries, callID); ok {
 			return accountID, true
 		}
+		if !continuationMetadataEnabled() {
+			continue
+		}
+		rec, ok := lookupContinuationBinding(continuationBindingFunctionCall, callID)
+		if !ok {
+			continue
+		}
+		storeCopilotTurnCacheEntry(&responseFunctionCallTurnCache.mu, responseFunctionCallTurnCache.entries, callID, rec.AccountID, bindingRecordContext(rec))
+		return rec.AccountID, true
 	}
 	return "", false
 }
@@ -371,7 +447,18 @@ func ResolveResponseFunctionCallSession(callIDs []string) SessionResolution {
 		if accountID, ok := lookupCopilotTurnCacheAccount(&responseFunctionCallTurnCache.mu, responseFunctionCallTurnCache.entries, id); ok {
 			accountSeen[accountID] = true
 			hits++
+			continue
 		}
+		if !continuationMetadataEnabled() {
+			continue
+		}
+		rec, ok := lookupContinuationBinding(continuationBindingFunctionCall, id)
+		if !ok {
+			continue
+		}
+		accountSeen[rec.AccountID] = true
+		hits++
+		storeCopilotTurnCacheEntry(&responseFunctionCallTurnCache.mu, responseFunctionCallTurnCache.entries, id, rec.AccountID, bindingRecordContext(rec))
 	}
 	miss := len(trimmed) - hits
 	switch len(accountSeen) {
@@ -393,13 +480,10 @@ func ResolveResponseFunctionCallSession(callIDs []string) SessionResolution {
 	}
 }
 
-// stashResponseFunctionCallTurnContextInMemory writes an account-bound context
-// for a set of call_ids into the in-memory function-call cache without
-// triggering the gzip-and-rename durable persist. Used by the stream-capture
-// path to record call_ids incrementally on each function_call item so that if
-// the upstream connection drops mid-stream the already-seen ids are still
-// bound to the account that minted them. Caller is responsible for a single
-// persistDurableContinuationState() call at stream terminal or termination.
+// stashResponseFunctionCallTurnContextInMemory records function-call bindings
+// as soon as they are visible on the stream so a mid-stream upstream drop does
+// not orphan the next continuation. When SQLite metadata authority is enabled,
+// the binding is written there immediately and also kept hot in memory.
 func stashResponseFunctionCallTurnContextInMemory(accountID string, callIDs []string, ctx copilotTurnContext) {
 	callIDs = uniqueTrimmed(callIDs)
 	if len(callIDs) == 0 {
@@ -408,6 +492,9 @@ func stashResponseFunctionCallTurnContextInMemory(accountID string, callIDs []st
 	ensureDurableContinuationStateLoaded()
 	for _, callID := range callIDs {
 		storeCopilotTurnCacheEntry(&responseFunctionCallTurnCache.mu, responseFunctionCallTurnCache.entries, callID, accountID, ctx)
+		if continuationMetadataEnabled() {
+			storeContinuationBinding(continuationBindingFunctionCall, callID, accountID, ctx)
+		}
 	}
 }
 
@@ -429,6 +516,19 @@ func EvictAccountContinuationCaches(accountID string) {
 	evicted += evictCopilotTurnCacheForAccountLocked(&responseFunctionCallTurnCache.mu, responseFunctionCallTurnCache.entries, accountID)
 	evicted += evictCopilotTurnCacheForAccountLocked(&messageToolCallTurnCache.mu, messageToolCallTurnCache.entries, accountID)
 	evicted += evictResponsesReplayForAccountLocked(accountID)
+	if continuationMetadataEnabled() {
+		if err := deleteContinuationBindingsForAccount(accountID); err != nil {
+			log.Printf("continuation metadata delete failed for account %s: %v", accountID, err)
+		}
+		if err := deleteResponsesReplayMetadataForAccount(accountID); err != nil {
+			log.Printf("responses replay metadata delete failed for account %s: %v", accountID, err)
+		}
+	}
+	if responsesReplayArchiveEnabled() {
+		if err := deleteResponsesReplayPayloadsColdForAccount(accountID); err != nil {
+			log.Printf("responses replay archive delete failed for account %s: %v", accountID, err)
+		}
+	}
 	if evicted > 0 {
 		persistDurableContinuationState()
 	}

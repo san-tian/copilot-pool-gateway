@@ -371,49 +371,154 @@ func storeResponsesReplay(accountID string, responseID string, input []interface
 	ensureDurableContinuationStateLoaded()
 
 	now := time.Now()
-	responsesReplayCache.mu.Lock()
-	responsesReplayCache.entries[responseID] = &responsesReplayEntry{
+	entry := &responsesReplayEntry{
 		AccountID:   accountID,
 		Input:       cloneJSONArray(input),
 		ReplayItems: cloneJSONArray(replayItems),
 		CreatedAt:   now,
 		AccessedAt:  now,
 	}
-	pruneResponsesReplayLocked(now)
-	responsesReplayCache.mu.Unlock()
+	storeResponsesReplayHot(responseID, entry)
 
-	persistDurableContinuationState()
+	archiveState := replayArchiveStateHotOnly
+	duckDBRef := responseID
+	if responsesReplayArchiveEnabled() && storeResponsesReplayPayloadCold(responseID, accountID, input, replayItems) {
+		archiveState = replayArchiveStateReady
+	}
+	if continuationMetadataEnabled() {
+		storeResponsesReplayMetadata(responseID, accountID, archiveState, duckDBRef)
+	} else {
+		persistDurableContinuationState()
+	}
 }
 
 func loadResponsesReplay(accountID string, responseID string) (*responsesReplayEntry, bool) {
 	ensureDurableContinuationStateLoaded()
-
-	now := time.Now()
-	responsesReplayCache.mu.Lock()
-	defer responsesReplayCache.mu.Unlock()
-
-	pruneResponsesReplayLocked(now)
-	entry, ok := responsesReplayCache.entries[responseID]
-	if !ok || entry.AccountID != accountID {
+	accountID = strings.TrimSpace(accountID)
+	responseID = strings.TrimSpace(responseID)
+	if accountID == "" || responseID == "" {
 		return nil, false
 	}
-	entry.AccessedAt = now
-	return &responsesReplayEntry{
-		AccountID:   entry.AccountID,
-		Input:       cloneJSONArray(entry.Input),
-		ReplayItems: cloneJSONArray(entry.ReplayItems),
-		CreatedAt:   entry.CreatedAt,
-		AccessedAt:  entry.AccessedAt,
-	}, true
+	if entry, ok := loadResponsesReplayHot(responseID); ok {
+		if entry.AccountID != accountID {
+			return nil, false
+		}
+		return entry, true
+	}
+	if continuationMetadataEnabled() {
+		rec, ok := lookupResponsesReplayMetadata(responseID)
+		if !ok || rec.AccountID != accountID {
+			return nil, false
+		}
+		if rec.ArchiveState == replayArchiveStateReady {
+			ref := strings.TrimSpace(rec.DuckDBRef)
+			if ref == "" {
+				ref = responseID
+			}
+			if entry, ok := loadResponsesReplayPayloadCold(ref); ok && entry.AccountID == accountID {
+				storeResponsesReplayHot(responseID, entry)
+				return entry, true
+			}
+		}
+		return nil, false
+	}
+	return nil, false
 }
 
 func loadResponsesReplayAny(responseID string) (*responsesReplayEntry, bool) {
 	ensureDurableContinuationStateLoaded()
+	responseID = strings.TrimSpace(responseID)
+	if responseID == "" {
+		return nil, false
+	}
+	if entry, ok := loadResponsesReplayHot(responseID); ok {
+		return entry, true
+	}
+	if continuationMetadataEnabled() {
+		rec, ok := lookupResponsesReplayMetadata(responseID)
+		if !ok || rec.ArchiveState != replayArchiveStateReady {
+			return nil, false
+		}
+		ref := strings.TrimSpace(rec.DuckDBRef)
+		if ref == "" {
+			ref = responseID
+		}
+		if entry, ok := loadResponsesReplayPayloadCold(ref); ok {
+			storeResponsesReplayHot(responseID, entry)
+			return entry, true
+		}
+		return nil, false
+	}
+	return nil, false
+}
 
+func LookupResponsesReplayAccount(responseID string) (string, bool) {
+	ensureDurableContinuationStateLoaded()
+	responseID = strings.TrimSpace(responseID)
+	if responseID == "" {
+		return "", false
+	}
+	if continuationMetadataEnabled() {
+		rec, ok := lookupResponsesReplayMetadata(responseID)
+		if ok {
+			return rec.AccountID, true
+		}
+	}
+	if entry, ok := loadResponsesReplayHot(responseID); ok {
+		return entry.AccountID, true
+	}
+	return "", false
+}
+
+func CanReplayResponsesContinuation(accountID string, responseID string) bool {
+	accountID = strings.TrimSpace(accountID)
+	responseID = strings.TrimSpace(responseID)
+	if accountID == "" || responseID == "" {
+		return false
+	}
+	if entry, ok := loadResponsesReplayHot(responseID); ok {
+		return entry.AccountID == accountID && len(entry.ReplayItems) > 0
+	}
+	if !continuationMetadataEnabled() {
+		return false
+	}
+	rec, ok := lookupResponsesReplayMetadata(responseID)
+	if !ok || rec.AccountID != accountID {
+		return false
+	}
+	return rec.ArchiveState == replayArchiveStateReady
+}
+
+func storeResponsesReplayHot(responseID string, entry *responsesReplayEntry) {
+	if entry == nil {
+		return
+	}
+	responseID = strings.TrimSpace(responseID)
+	if responseID == "" {
+		return
+	}
 	now := time.Now()
 	responsesReplayCache.mu.Lock()
 	defer responsesReplayCache.mu.Unlock()
+	pruneResponsesReplayLocked(now)
+	responsesReplayCache.entries[responseID] = &responsesReplayEntry{
+		AccountID:   entry.AccountID,
+		Input:       cloneJSONArray(entry.Input),
+		ReplayItems: cloneJSONArray(entry.ReplayItems),
+		CreatedAt:   entry.CreatedAt,
+		AccessedAt:  now,
+	}
+	pruneResponsesReplayLocked(now)
+}
 
+func loadResponsesReplayHot(responseID string) (*responsesReplayEntry, bool) {
+	responseID = strings.TrimSpace(responseID)
+	if responseID == "" {
+		return nil, false
+	}
+	now := time.Now()
+	responsesReplayCache.mu.Lock()
+	defer responsesReplayCache.mu.Unlock()
 	pruneResponsesReplayLocked(now)
 	entry, ok := responsesReplayCache.entries[responseID]
 	if !ok {
@@ -427,27 +532,6 @@ func loadResponsesReplayAny(responseID string) (*responsesReplayEntry, bool) {
 		CreatedAt:   entry.CreatedAt,
 		AccessedAt:  entry.AccessedAt,
 	}, true
-}
-
-func LookupResponsesReplayAccount(responseID string) (string, bool) {
-	ensureDurableContinuationStateLoaded()
-
-	now := time.Now()
-	responsesReplayCache.mu.Lock()
-	defer responsesReplayCache.mu.Unlock()
-
-	pruneResponsesReplayLocked(now)
-	entry, ok := responsesReplayCache.entries[responseID]
-	if !ok {
-		return "", false
-	}
-	entry.AccessedAt = now
-	return entry.AccountID, true
-}
-
-func CanReplayResponsesContinuation(accountID string, responseID string) bool {
-	entry, ok := loadResponsesReplay(accountID, responseID)
-	return ok && len(entry.ReplayItems) > 0
 }
 
 func pruneResponsesReplayLocked(now time.Time) {

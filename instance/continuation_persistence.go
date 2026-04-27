@@ -21,11 +21,8 @@ var continuationStateLoadOnce sync.Once
 var continuationStateWriteMu sync.Mutex
 var durableContinuationPersistenceDisabled bool
 
-// Async debounced persister. Writing the full state snapshot is an O(cache-size)
-// operation (observed 130MB JSON + gzip on a busy node) and was previously
-// triggered synchronously on every store* mutation while holding the call path
-// that pi-client waits on to see the TCP FIN. Signal coalescing collapses a
-// burst of store* calls into at most one on-disk write per debounce window.
+// Legacy JSON snapshot writes are disabled. The file remains readable for a
+// one-time metadata import path, but SQLite and DuckDB are now the live stores.
 var (
 	persistWakeCh        = make(chan struct{}, 1)
 	persistLoopStartOnce sync.Once
@@ -91,12 +88,14 @@ func loadDurableContinuationState() error {
 	}
 
 	now := time.Now()
-	if clientMachineID := strings.TrimSpace(snapshot.ClientMachineID); clientMachineID != "" {
-		copilotClientMachineID = clientMachineID
+	if continuationMetadataPersistenceDisabled {
+		if clientMachineID := strings.TrimSpace(snapshot.ClientMachineID); clientMachineID != "" {
+			copilotClientMachineID = clientMachineID
+		}
+		restoreCopilotTurnCacheEntries(&responseTurnCache.mu, responseTurnCache.entries, snapshot.ResponseTurns, copilotTurnCacheTTL, now)
+		restoreCopilotTurnCacheEntries(&responseFunctionCallTurnCache.mu, responseFunctionCallTurnCache.entries, snapshot.ResponseFunctionCallTurns, copilotTurnCacheTTL, now)
+		restoreCopilotTurnCacheEntries(&messageToolCallTurnCache.mu, messageToolCallTurnCache.entries, snapshot.MessageToolTurns, copilotTurnCacheTTL, now)
 	}
-	restoreCopilotTurnCacheEntries(&responseTurnCache.mu, responseTurnCache.entries, snapshot.ResponseTurns, copilotTurnCacheTTL, now)
-	restoreCopilotTurnCacheEntries(&responseFunctionCallTurnCache.mu, responseFunctionCallTurnCache.entries, snapshot.ResponseFunctionCallTurns, copilotTurnCacheTTL, now)
-	restoreCopilotTurnCacheEntries(&messageToolCallTurnCache.mu, messageToolCallTurnCache.entries, snapshot.MessageToolTurns, copilotTurnCacheTTL, now)
 	restoreResponsesReplayEntries(snapshot.ResponsesReplay, now)
 	return nil
 }
@@ -204,87 +203,19 @@ func restoreResponsesReplayEntries(snapshot map[string]durableResponsesReplayEnt
 	pruneResponsesReplayLocked(now)
 }
 
-// persistDurableContinuationState schedules a background write of the current
-// state. It returns immediately; the actual gzip+rename happens on a debounced
-// background goroutine so a burst of store* mutations coalesces into one write.
-// Tests that need the write to be visible on disk before reading must call
-// flushDurableContinuationStateForTests.
-func persistDurableContinuationState() {
-	if durableContinuationPersistenceDisabled {
-		return
-	}
-	ensureDurableContinuationStateLoaded()
-	ensureDurableContinuationPersistLoop()
-	select {
-	case persistWakeCh <- struct{}{}:
-	default:
-		// Already queued — coalesce.
-	}
-}
+// persistDurableContinuationState is intentionally a no-op. Legacy snapshot
+// writes have been removed; callers remain only for transition compatibility.
+func persistDurableContinuationState() {}
 
-func ensureDurableContinuationPersistLoop() {
-	persistLoopStartOnce.Do(func() {
-		go durableContinuationPersistLoop()
-	})
-}
+func ensureDurableContinuationPersistLoop() {}
 
-func durableContinuationPersistLoop() {
-	for range persistWakeCh {
-		// Debounce window: let further signals land in the buffer while we sleep.
-		time.Sleep(persistDebounce)
-		// Drain any coalesced signal that piled up during the sleep.
-		select {
-		case <-persistWakeCh:
-		default:
-		}
-		persistDurableContinuationStateNow()
-	}
-}
+func durableContinuationPersistLoop() {}
 
-// persistDurableContinuationStateNow does the synchronous snapshot + gzip +
-// atomic-rename write. Called from the background persist loop and from the
-// test flush helper. Safe to call directly in shutdown / eviction paths that
-// need the write to have completed by the time the call returns.
-func persistDurableContinuationStateNow() {
-	if durableContinuationPersistenceDisabled {
-		return
-	}
-	ensureDurableContinuationStateLoaded()
+func persistDurableContinuationStateNow() {}
 
-	continuationStateWriteMu.Lock()
-	defer continuationStateWriteMu.Unlock()
-
-	snapshot := captureDurableContinuationState()
-	body, err := json.Marshal(snapshot)
-	if err != nil {
-		log.Printf("Failed to marshal durable continuation state: %v", err)
-		return
-	}
-
-	path := continuationStateFile()
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		log.Printf("Failed to create durable continuation state dir: %v", err)
-		return
-	}
-	tmpPath := path + ".tmp"
-	if err := writeGzipFile(tmpPath, body); err != nil {
-		log.Printf("Failed to write durable continuation state: %v", err)
-		return
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		_ = os.Remove(tmpPath)
-		log.Printf("Failed to replace durable continuation state: %v", err)
-		return
-	}
-	_ = os.Remove(legacyContinuationStateFile())
-}
-
-// flushDurableContinuationStateForTests synchronously writes any pending state
-// to disk. Tests that invoke store* mutators and then inspect the on-disk file
-// must call this first to avoid racing the background persist loop.
-func flushDurableContinuationStateForTests() {
-	persistDurableContinuationStateNow()
-}
+// flushDurableContinuationStateForTests is also a no-op now that production no
+// longer writes continuation-state.json(.gz).
+func flushDurableContinuationStateForTests() {}
 
 func writeGzipFile(path string, body []byte) error {
 	file, err := os.Create(path)

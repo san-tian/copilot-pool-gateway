@@ -197,6 +197,13 @@ func main() {
 		log.Printf("Using HTTP proxy: %s", proxyCfg.ProxyURL)
 	}
 
+	if err := instance.InitContinuationMetadataStore(); err != nil {
+		log.Fatalf("Failed to initialize continuation metadata store: %v", err)
+	}
+	if err := instance.InitResponsesReplayArchiveStore(); err != nil {
+		log.Fatalf("Failed to initialize responses replay archive store: %v", err)
+	}
+
 	if sup := initWorkerSupervisor(); sup != nil {
 		instance.SetDefaultSupervisor(sup)
 		sup.RecoverFromStore(ctx)
@@ -276,6 +283,12 @@ func main() {
 	if sup := instance.DefaultSupervisor(); sup != nil {
 		sup.Shutdown(shutdownCtx)
 		instance.SetDefaultSupervisor(nil)
+	}
+	if err := instance.CloseContinuationMetadataStore(); err != nil {
+		log.Printf("Continuation metadata store shutdown error: %v", err)
+	}
+	if err := instance.CloseResponsesReplayArchiveStore(); err != nil {
+		log.Printf("Responses replay archive store shutdown error: %v", err)
 	}
 	if serverErr != nil {
 		log.Fatalf("%v", serverErr)

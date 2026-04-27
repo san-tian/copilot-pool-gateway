@@ -195,6 +195,18 @@ func ResponsesOrphanTranslate() string {
 	return "off"
 }
 
+func ContinuationMetadataRetention() time.Duration {
+	v := strings.TrimSpace(os.Getenv("COPILOT_CONTINUATION_METADATA_RETENTION"))
+	if v == "" {
+		return 14 * 24 * time.Hour
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return 14 * 24 * time.Hour
+	}
+	return d
+}
+
 func CopilotBaseURL(accountType string) string {
 	if accountType == "" || accountType == "individual" {
 		return CopilotIndividualChatURL
