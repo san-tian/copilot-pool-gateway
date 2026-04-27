@@ -421,6 +421,16 @@ func handleAnthropicStream(c *gin.Context, accountID string, turnRequest copilot
 	state := anthropic.NewStreamState()
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 10*1024*1024), 10*1024*1024)
+	stashedToolIDs := map[string]bool{}
+	stashNewToolIDs := func() {
+		for _, id := range collectToolCallIDsFromStreamState(state) {
+			if stashedToolIDs[id] {
+				continue
+			}
+			stashedToolIDs[id] = true
+			storeMessageToolCallTurnContext(accountID, []string{id}, turnRequest.Context)
+		}
+	}
 
 	for scanner.Scan() {
 		select {
@@ -455,6 +465,7 @@ func handleAnthropicStream(c *gin.Context, accountID string, turnRequest copilot
 		}
 
 		events := anthropic.TranslateChunkToAnthropicEvents(chunk, state)
+		stashNewToolIDs()
 		for _, event := range events {
 			if err := writeSSE(w, event.Event, event.Data); err != nil {
 				log.Printf("[Stream] Write error: %v", err)

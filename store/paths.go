@@ -48,6 +48,14 @@ func ProxyConfigFile() string {
 	return filepath.Join(AppDir, "proxy-config.json")
 }
 
+func ContinuationSQLiteFile() string {
+	return filepath.Join(AppDir, "continuation.sqlite")
+}
+
+func PayloadDuckDBFile() string {
+	return filepath.Join(AppDir, "payload.duckdb")
+}
+
 func WorkersRoot() string {
 	if override := strings.TrimSpace(os.Getenv(WorkersRootEnvVar)); override != "" {
 		return override
