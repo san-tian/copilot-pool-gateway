@@ -303,7 +303,9 @@ func extractResponseFunctionCallOutputIDs(bodyBytes []byte) []string {
 			return
 		}
 		itemType, _ := entry["type"].(string)
-		if strings.TrimSpace(strings.ToLower(itemType)) != "function_call_output" {
+		switch strings.TrimSpace(strings.ToLower(itemType)) {
+		case "function_call_output", "custom_tool_call_output":
+		default:
 			return
 		}
 		if callID, _ := entry["call_id"].(string); strings.TrimSpace(callID) != "" {
@@ -1193,7 +1195,7 @@ const (
 	// rotate to a different account (which would orphan on upstream).
 	continuationBindingAccountUnavailable
 	// continuationBindingSplit — two or more accounts each own a subset of
-	// this request's function_call_output call_ids. Upstream validation is
+	// this request's tool-call output call_ids. Upstream validation is
 	// all-or-nothing per account, so no dispatch is safe. 409: the user
 	// must restart.
 	continuationBindingSplit
@@ -1215,7 +1217,7 @@ type continuationBindingResult struct {
 }
 
 // resolveContinuationBinding classifies a continuation request (prev_id or
-// function_call_output ids present) against the sticky cache without
+// tool-call output ids present) against the sticky cache without
 // touching any HTTP context. Pure function: the caller decides how to turn
 // the result into a response and does the HTTP work. `previousResponseID`
 // takes precedence over the fc_ids path — if both are set, we bind by
@@ -1236,7 +1238,7 @@ func resolveContinuationBinding(previousResponseID string, functionCallOutputIDs
 		return canonicalAccountBinding(accountID, requestedModel)
 	}
 	if len(functionCallOutputIDs) == 0 {
-		return continuationBindingResult{Kind: continuationBindingOrphan, Reason: "no previous_response_id and no function_call_output ids"}
+		return continuationBindingResult{Kind: continuationBindingOrphan, Reason: "no previous_response_id and no tool_call_output ids"}
 	}
 	session := instance.ResolveResponseFunctionCallSession(functionCallOutputIDs)
 	switch session.Kind {
@@ -1249,14 +1251,14 @@ func resolveContinuationBinding(previousResponseID string, functionCallOutputIDs
 		return continuationBindingResult{
 			Kind:          continuationBindingSplit,
 			SplitAccounts: session.SplitAccounts,
-			Reason:        fmt.Sprintf("function_call_output history spans %d accounts: %s", len(session.SplitAccounts), strings.Join(session.SplitAccounts, ", ")),
+			Reason:        fmt.Sprintf("tool_call_output history spans %d accounts: %s", len(session.SplitAccounts), strings.Join(session.SplitAccounts, ", ")),
 			HitCount:      session.HitCount,
 			MissCount:     session.MissCount,
 		}
 	default: // SessionOrphan
 		return continuationBindingResult{
 			Kind:      continuationBindingOrphan,
-			Reason:    fmt.Sprintf("no function_call_output call_id matches any known session (hits=0 misses=%d)", session.MissCount),
+			Reason:    fmt.Sprintf("no tool_call_output call_id matches any known session (hits=0 misses=%d)", session.MissCount),
 			HitCount:  0,
 			MissCount: session.MissCount,
 		}
@@ -1434,7 +1436,7 @@ func proxyResponses(c *gin.Context) {
 	// Strict per-session binding for continuation requests.
 	//
 	// A continuation is any request that carries previous_response_id OR
-	// function_call_output ids from a prior turn. Upstream Copilot validates
+	// tool-call output ids from a prior turn. Upstream Copilot validates
 	// those ids against the specific account+interaction that minted them:
 	// if we dispatch to a different account than the one that owns the
 	// history, upstream returns `input item does not belong to this
@@ -1498,7 +1500,7 @@ func proxyResponses(c *gin.Context) {
 			return
 		case continuationBindingOrphan:
 			// Default-on non-lossy passthrough for cross-relay migration:
-			// when the orphan is a function_call_output orphan (input is
+			// when the orphan is a tool-call-output orphan (input is
 			// self-contained, history is present in full), worker mode is
 			// available, and no degrade opt-in was requested, clear sticky
 			// state and route fresh. With RESPONSES_ORPHAN_TRANSLATE=on, the

@@ -48,6 +48,21 @@ func TestContinuationDegradeOptIn(t *testing.T) {
 	}
 }
 
+func TestExtractResponseFunctionCallOutputIDsIncludesCustomToolOutputs(t *testing.T) {
+	body := []byte(`{
+		"input": [
+			{"type":"function_call_output","call_id":"call_fn","output":"ok"},
+			{"type":"custom_tool_call_output","call_id":"call_custom","output":"ok"},
+			{"type":"message","role":"user","content":"ignore"}
+		]
+	}`)
+
+	got := extractResponseFunctionCallOutputIDs(body)
+	if len(got) != 2 || got[0] != "call_fn" || got[1] != "call_custom" {
+		t.Fatalf("expected function and custom tool output ids, got %#v", got)
+	}
+}
+
 func TestResponsesSessionAffinityKeyPrefersExplicitHeader(t *testing.T) {
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
@@ -214,7 +229,7 @@ func TestWriteSessionBindingErrorSplit(t *testing.T) {
 	writeSessionBindingError(c, "rid-test", continuationBindingResult{
 		Kind:          continuationBindingSplit,
 		SplitAccounts: []string{"acct-a", "acct-b"},
-		Reason:        "function_call_output history spans 2 accounts: acct-a, acct-b",
+		Reason:        "tool_call_output history spans 2 accounts: acct-a, acct-b",
 	})
 
 	if w.Code != http.StatusConflict {
@@ -241,7 +256,7 @@ func TestWriteSessionBindingErrorOrphan(t *testing.T) {
 
 	writeSessionBindingError(c, "rid-test", continuationBindingResult{
 		Kind:   continuationBindingOrphan,
-		Reason: "no function_call_output call_id matches any known session (hits=0 misses=5)",
+		Reason: "no tool_call_output call_id matches any known session (hits=0 misses=5)",
 	})
 
 	if w.Code != http.StatusGone {
@@ -256,7 +271,7 @@ func TestWriteSessionBindingErrorOrphan(t *testing.T) {
 		t.Fatalf("expected type session_expired, got %v", errObj["type"])
 	}
 	msg, _ := errObj["message"].(string)
-	if !strings.Contains(msg, "no function_call_output call_id matches") {
+	if !strings.Contains(msg, "no tool_call_output call_id matches") {
 		t.Fatalf("expected reason text in message, got %q", msg)
 	}
 }

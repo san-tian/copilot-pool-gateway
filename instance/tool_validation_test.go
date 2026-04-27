@@ -123,3 +123,42 @@ func TestRewritePreviousResponseContinuationAcceptsMatchingToolOutputs(t *testin
 		t.Fatalf("expected scrubbed continuation item without id, got %#v", last)
 	}
 }
+
+func TestRewritePreviousResponseContinuationAcceptsCustomToolOutputs(t *testing.T) {
+	resetCopilotTurnCaches()
+
+	storeResponsesReplay(
+		"acct-1",
+		"resp_custom_prev",
+		[]interface{}{map[string]interface{}{"role": "user", "content": "first"}},
+		[]interface{}{map[string]interface{}{"type": "custom_tool_call", "call_id": "call_custom", "name": "shell", "input": "{}"}},
+	)
+
+	payload := map[string]interface{}{
+		"previous_response_id": "resp_custom_prev",
+		"input": []interface{}{
+			map[string]interface{}{"type": "custom_tool_call_output", "call_id": "call_custom", "output": "ok"},
+		},
+	}
+
+	if err := rewritePreviousResponseContinuation("acct-1", payload); err != nil {
+		t.Fatalf("expected custom tool continuation to pass, got %v", err)
+	}
+	input := payload["input"].([]interface{})
+	if len(input) != 3 {
+		t.Fatalf("expected replay input with custom tool call and output, got %#v", input)
+	}
+}
+
+func TestCollectResponsesFunctionCallIDsIncludesCustomToolCalls(t *testing.T) {
+	items := []interface{}{
+		map[string]interface{}{"type": "function_call", "call_id": "call_fn"},
+		map[string]interface{}{"type": "custom_tool_call", "call_id": "call_custom"},
+		map[string]interface{}{"type": "message", "role": "assistant", "content": "ignore"},
+	}
+
+	got := collectResponsesFunctionCallIDs(items)
+	if len(got) != 2 || got[0] != "call_fn" || got[1] != "call_custom" {
+		t.Fatalf("expected function and custom tool call ids, got %#v", got)
+	}
+}

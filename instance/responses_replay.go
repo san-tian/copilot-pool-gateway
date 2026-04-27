@@ -257,7 +257,7 @@ func collectResponsesFunctionCallIDs(items []interface{}) []string {
 			continue
 		}
 		itemType, _ := payload["type"].(string)
-		if strings.TrimSpace(strings.ToLower(itemType)) != "function_call" {
+		if !isResponsesFunctionCallType(itemType) {
 			continue
 		}
 		if callID, _ := payload["call_id"].(string); strings.TrimSpace(callID) != "" {
@@ -275,7 +275,7 @@ func collectResponsesFunctionCallOutputIDs(items []interface{}) []string {
 			continue
 		}
 		itemType, _ := payload["type"].(string)
-		if strings.TrimSpace(strings.ToLower(itemType)) != "function_call_output" {
+		if !isResponsesFunctionCallOutputType(itemType) {
 			continue
 		}
 		if callID, _ := payload["call_id"].(string); strings.TrimSpace(callID) != "" {
@@ -302,7 +302,25 @@ func isReplayableResponseItem(item interface{}) bool {
 	}
 	itemType, _ := payload["type"].(string)
 	switch itemType {
-	case "reasoning", "function_call":
+	case "reasoning", "function_call", "custom_tool_call":
+		return true
+	default:
+		return false
+	}
+}
+
+func isResponsesFunctionCallType(itemType string) bool {
+	switch strings.TrimSpace(strings.ToLower(itemType)) {
+	case "function_call", "custom_tool_call":
+		return true
+	default:
+		return false
+	}
+}
+
+func isResponsesFunctionCallOutputType(itemType string) bool {
+	switch strings.TrimSpace(strings.ToLower(itemType)) {
+	case "function_call_output", "custom_tool_call_output":
 		return true
 	default:
 		return false
