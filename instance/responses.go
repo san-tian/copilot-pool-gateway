@@ -141,6 +141,7 @@ func ForwardResponsesResponse(c *gin.Context, accountID string, turnRequest copi
 		_ = resp.Body.Close()
 		log.Printf("[responses rid=%s] post_close_ms=%d (resp.Body.Close)", reqID, time.Since(closeStart).Milliseconds())
 	}()
+	applyRoutingResponseHeaders(c, accountID)
 
 	contentType := resp.Header.Get("Content-Type")
 	isStream := strings.Contains(contentType, "text/event-stream")

@@ -31,6 +31,9 @@ func DoCompletionsProxy(_ *gin.Context, state *config.State, bodyBytes []byte) (
 // ForwardCompletionsResponse writes the upstream response to the client.
 func ForwardCompletionsResponse(c *gin.Context, resp *http.Response) {
 	defer func() { _ = resp.Body.Close() }()
+	accountID, _ := c.Get("respAccountID")
+	accountIDStr, _ := accountID.(string)
+	applyRoutingResponseHeaders(c, accountIDStr)
 
 	contentType := resp.Header.Get("Content-Type")
 	isStream := strings.Contains(contentType, "text/event-stream")
@@ -46,9 +49,7 @@ func ForwardCompletionsResponse(c *gin.Context, resp *http.Response) {
 		c.Status(resp.StatusCode)
 
 		reqID, _ := c.Get("respReqID")
-		accountID, _ := c.Get("respAccountID")
 		reqIDStr, _ := reqID.(string)
-		accountIDStr, _ := accountID.(string)
 
 		reader := bufio.NewReaderSize(resp.Body, 10*1024*1024)
 		var probe streamTailProbe
@@ -207,6 +208,7 @@ func doMessagesProxy(c *gin.Context, accountID string, state *config.State, body
 // originalBody is the original Anthropic request (used to determine stream mode).
 func ForwardMessagesResponse(c *gin.Context, accountID string, turnRequest copilotTurnRequest, resp *http.Response, originalBody []byte) {
 	defer func() { _ = resp.Body.Close() }()
+	applyRoutingResponseHeaders(c, accountID)
 
 	var anthropicPayload anthropic.AnthropicMessagesPayload
 	if err := json.Unmarshal(originalBody, &anthropicPayload); err != nil {
