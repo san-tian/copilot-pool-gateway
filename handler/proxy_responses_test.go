@@ -167,3 +167,22 @@ func TestResolveContinuationBindingPrevIdMissesCache(t *testing.T) {
 		t.Fatalf("expected prev_id echoed in reason, got %q", result.Reason)
 	}
 }
+
+func TestOrphanTranslateRouteForModel(t *testing.T) {
+	cases := []struct {
+		model string
+		want  string
+	}{
+		{"gpt-5.4", "messages"},
+		{"claude-opus-4.7", "messages"},
+		{"gpt-4o-mini", "chat"},
+		{"", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.model, func(t *testing.T) {
+			if got := orphanTranslateRouteForModel(tc.model); got != tc.want {
+				t.Fatalf("orphanTranslateRouteForModel(%q) = %q, want %q", tc.model, got, tc.want)
+			}
+		})
+	}
+}

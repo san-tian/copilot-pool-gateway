@@ -642,6 +642,17 @@ func orphanTranslateMessagesModel(model string) bool {
 	return false
 }
 
+func orphanTranslateRouteForModel(model string) string {
+	switch {
+	case orphanTranslateMessagesModel(model):
+		return "messages"
+	case orphanTranslateCompatibleModel(model):
+		return "chat"
+	default:
+		return ""
+	}
+}
+
 // isRetryableStatus returns true for HTTP status codes that warrant a retry with a different account.
 // 401 is included because a single account can transiently return 401 during its Copilot-token
 // refresh window; rolling over to another account lets the client succeed while the failing
@@ -1612,30 +1623,24 @@ func proxyResponses(c *gin.Context) {
 				// and already runs on orphan-bound traffic today. Guarded by
 				// orphanDegraded so a single request degrades at most once.
 				if !orphanDegraded && attempt < attemptLimit-1 && config.ResponsesOrphanTranslate() == "on" {
-					acct, _ := store.GetAccount(resolved.AccountID)
-					hasWorker := acct != nil && strings.TrimSpace(acct.WorkerURL) != ""
-					if hasWorker {
-						armed := ""
-						switch {
-						case orphanTranslateMessagesModel(requestedModel):
-							orphanTranslateMessages = true
-							armed = "messages"
-						case orphanTranslateCompatibleModel(requestedModel):
-							orphanTranslate = true
-							armed = "chat"
-						}
-						if armed != "" {
-							orphanDegraded = true
-							exclude[resolved.AccountID] = true
-							previousResponseID = ""
-							functionCallOutputIDs = nil
-							continuationRequested = false
-							continuationPinned = nil
-							crossAccountRollover = false
-							log.Printf("[responses rid=%s attempt=%d] replay-invalid on account=%s mode=%s, re-dispatching via orphan_translate route=%s; detail=%q",
-								reqID, attempt, resolved.AccountID, modeName, armed, truncateForLog(detail, 240))
-							continue
-						}
+					armed := orphanTranslateRouteForModel(requestedModel)
+					switch armed {
+					case "messages":
+						orphanTranslateMessages = true
+					case "chat":
+						orphanTranslate = true
+					}
+					if armed != "" {
+						orphanDegraded = true
+						exclude[resolved.AccountID] = true
+						previousResponseID = ""
+						functionCallOutputIDs = nil
+						continuationRequested = false
+						continuationPinned = nil
+						crossAccountRollover = false
+						log.Printf("[responses rid=%s attempt=%d] replay-invalid on account=%s mode=%s, re-dispatching via orphan_translate route=%s; detail=%q",
+							reqID, attempt, resolved.AccountID, modeName, armed, truncateForLog(detail, 240))
+						continue
 					}
 				}
 				log.Printf("[responses rid=%s attempt=%d] replay-invalid on account=%s mode=%s, emitting 502 (can_detach=%v attempt_budget_left=%v is_pool=%v orphan_degraded=%v degrade_opt_in=%v); detail=%q",
