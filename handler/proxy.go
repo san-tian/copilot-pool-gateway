@@ -1595,81 +1595,86 @@ func proxyResponses(c *gin.Context) {
 			return
 		}
 
-		if continuationRequested {
-			if replayInvalid, detail := readReplayInvalidResponse(resp); replayInvalid {
-				instance.RecordRequest(resolved.AccountID, true, false)
-				_ = resp.Body.Close()
-				if continuationCanDetach && attempt < attemptLimit-1 && isPool == true {
+		if replayInvalid, detail := readReplayInvalidResponse(resp); replayInvalid {
+			instance.RecordRequest(resolved.AccountID, true, false)
+			_ = resp.Body.Close()
+			if continuationRequested && continuationCanDetach && attempt < attemptLimit-1 && isPool == true {
+				exclude[resolved.AccountID] = true
+				crossAccountRollover = true
+				log.Printf("[responses rid=%s attempt=%d] replay-invalid on account=%s mode=%s, rolling over cross-account; detail=%q",
+					reqID, attempt, resolved.AccountID, modeName, truncateForLog(detail, 240))
+				continue
+			}
+			// The in-loop orphan-degrade branch text-ifies the tool
+			// history when upstream reports `input item does not belong to
+			// this connection`. It is the real driver of the codex
+			// write_stdin death loop: once degrade fires, the model sees
+			// a summarized history every subsequent turn and never
+			// regains tool-loop structure. Gate it on the same opt-in
+			// header the pre-loop orphan branch uses so native clients
+			// (codex, pi) get a typed 502 they can react to, and sub2api
+			// continues to get best-effort degrade when it asks.
+			if degradeOptIn && !orphanDegraded && attempt < attemptLimit-1 {
+				degradedBody, changed, degErr := instance.DegradeOrphanContinuationPayload(bodyBytes)
+				if degErr == nil && changed > 0 {
+					bodyBytes = degradedBody
+					orphanDegraded = true
 					exclude[resolved.AccountID] = true
-					crossAccountRollover = true
-					log.Printf("[responses rid=%s attempt=%d] replay-invalid on account=%s mode=%s, rolling over cross-account; detail=%q",
-						reqID, attempt, resolved.AccountID, modeName, truncateForLog(detail, 240))
+					previousResponseID = ""
+					functionCallOutputIDs = nil
+					continuationRequested = false
+					continuationPinned = nil
+					crossAccountRollover = false
+					log.Printf("[responses rid=%s attempt=%d] orphan continuation on account=%s mode=%s, degraded %d fc items to text, retrying fresh; detail=%q",
+						reqID, attempt, resolved.AccountID, modeName, changed, truncateForLog(detail, 240))
+					log.Printf("[responses rid=%s attempt=%d] degraded body top-level keys=%s input_shape=[%s]",
+						reqID, attempt, degradedBodyTopLevelKeys(degradedBody), degradedInputShape(degradedBody))
 					continue
 				}
-				// The in-loop orphan-degrade branch text-ifies the tool
-				// history when upstream reports `input item does not belong to
-				// this connection`. It is the real driver of the codex
-				// write_stdin death loop: once degrade fires, the model sees
-				// a summarized history every subsequent turn and never
-				// regains tool-loop structure. Gate it on the same opt-in
-				// header the pre-loop orphan branch uses so native clients
-				// (codex, pi) get a typed 502 they can react to, and sub2api
-				// continues to get best-effort degrade when it asks.
-				if degradeOptIn && !orphanDegraded && attempt < attemptLimit-1 {
-					degradedBody, changed, degErr := instance.DegradeOrphanContinuationPayload(bodyBytes)
-					if degErr == nil && changed > 0 {
-						bodyBytes = degradedBody
-						orphanDegraded = true
-						exclude[resolved.AccountID] = true
-						previousResponseID = ""
-						functionCallOutputIDs = nil
-						continuationRequested = false
-						continuationPinned = nil
-						crossAccountRollover = false
-						log.Printf("[responses rid=%s attempt=%d] orphan continuation on account=%s mode=%s, degraded %d fc items to text, retrying fresh; detail=%q",
-							reqID, attempt, resolved.AccountID, modeName, changed, truncateForLog(detail, 240))
-						log.Printf("[responses rid=%s attempt=%d] degraded body top-level keys=%s input_shape=[%s]",
-							reqID, attempt, degradedBodyTopLevelKeys(degradedBody), degradedInputShape(degradedBody))
-						continue
-					}
-					log.Printf("[responses rid=%s attempt=%d] orphan degrade skipped (changed=%d err=%v)", reqID, attempt, changed, degErr)
-				}
-				// Canonical binding said "this account owns the history" but
-				// upstream disagreed (session state was evicted / rotated).
-				// Treat this as a late orphan and fall through to the orphan
-				// translate path, which flattens tool history and dispatches
-				// to the worker's stateless endpoint. Unlike the opt-in
-				// degrade above, this does NOT require the degrade header —
-				// the translator is the canonical flatten-and-retry mechanism
-				// and already runs on orphan-bound traffic today. Guarded by
-				// orphanDegraded so a single request degrades at most once.
-				if !orphanDegraded {
-					recovery = resolveOrphanRecoveryState(c, requestedModel, exclude, "canonical upstream rejected continuation", resolved.AccountID)
-					if recovery.armed() {
-						orphanDegraded = true
-						if attempt >= attemptLimit-1 {
-							attemptLimit++
-						}
-						previousResponseID = ""
-						functionCallOutputIDs = nil
-						continuationRequested = false
-						continuationPinned = nil
-						crossAccountRollover = false
-						pinnedAccount = resolved
-						pinnedAccountKind = "recovery_same_account"
-						log.Printf("[responses rid=%s attempt=%d] recovery armed after replay-invalid recovery_from_account=%q recovery_to_account=%q recovery_route=%s previous_mode=%s detail=%q",
-							reqID, attempt, resolved.AccountID, resolved.AccountID, recovery.Route.logName(), modeName, truncateForLog(detail, 240))
-						continue
-					}
-				}
-				log.Printf("[responses rid=%s attempt=%d] replay-invalid on account=%s mode=%s, emitting 502 (can_detach=%v attempt_budget_left=%v is_pool=%v orphan_degraded=%v degrade_opt_in=%v); detail=%q",
-					reqID, attempt, resolved.AccountID, modeName, continuationCanDetach, attempt < attemptLimit-1, isPool == true, orphanDegraded, degradeOptIn, truncateForLog(detail, 240))
-				c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{
-					"type":    "session_upstream_orphan",
-					"message": "upstream rejected the continuation: the tool-call history cannot be replayed on the bound account. Restart the conversation.",
-				}})
-				return
+				log.Printf("[responses rid=%s attempt=%d] orphan degrade skipped (changed=%d err=%v)", reqID, attempt, changed, degErr)
 			}
+			// Canonical binding said "this account owns the history" but
+			// upstream disagreed (session state was evicted / rotated).
+			// Treat this as a late orphan and fall through to the orphan
+			// translate path, which flattens tool history and dispatches
+			// to the worker's stateless endpoint. Unlike the opt-in
+			// degrade above, this does NOT require the degrade header —
+			// the translator is the canonical flatten-and-retry mechanism
+			// and already runs on orphan-bound traffic today. Guarded by
+			// orphanDegraded and recovery.armed() so a single request does
+			// not keep re-arming the same recovery route.
+			if !orphanDegraded && !recovery.armed() {
+				recovery = resolveOrphanRecoveryState(c, requestedModel, exclude, "upstream rejected continuation", resolved.AccountID)
+				if recovery.armed() {
+					orphanDegraded = true
+					if attempt >= attemptLimit-1 {
+						attemptLimit++
+					}
+					previousResponseID = ""
+					functionCallOutputIDs = nil
+					continuationRequested = false
+					continuationPinned = nil
+					crossAccountRollover = false
+					pinnedAccount = resolved
+					pinnedAccountKind = "recovery_same_account"
+					log.Printf("[responses rid=%s attempt=%d] recovery armed after replay-invalid recovery_from_account=%q recovery_to_account=%q recovery_route=%s previous_mode=%s detail=%q",
+						reqID, attempt, resolved.AccountID, resolved.AccountID, recovery.Route.logName(), modeName, truncateForLog(detail, 240))
+					continue
+				}
+			}
+			if recovery.armed() && isPool == true && attempt < attemptLimit-1 {
+				exclude[resolved.AccountID] = true
+				log.Printf("[responses rid=%s attempt=%d] replay-invalid during recovery route=%s account=%s, retrying different account; detail=%q",
+					reqID, attempt, recovery.Route.logName(), resolved.AccountID, truncateForLog(detail, 240))
+				continue
+			}
+			log.Printf("[responses rid=%s attempt=%d] replay-invalid on account=%s mode=%s, emitting typed 502 (can_detach=%v attempt_budget_left=%v is_pool=%v recovery_route=%s orphan_degraded=%v degrade_opt_in=%v); detail=%q",
+				reqID, attempt, resolved.AccountID, modeName, continuationCanDetach, attempt < attemptLimit-1, isPool == true, recovery.Route.logName(), orphanDegraded, degradeOptIn, truncateForLog(detail, 240))
+			c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{
+				"type":    "session_upstream_orphan",
+				"message": "upstream rejected the continuation: the tool-call history cannot be replayed on the bound account. Restart the conversation.",
+			}})
+			return
 		}
 
 		if disabled, reason := disableOnFatalUpstream(resp, resolved.AccountID, requestedModel); disabled {

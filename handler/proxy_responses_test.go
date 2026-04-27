@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -210,5 +211,40 @@ func TestContinuationRecoveryStateArmed(t *testing.T) {
 	recovery := continuationRecoveryState{Route: orphanTranslateRouteMessages, Reason: "replay-invalid", FromAccount: "acct-a"}
 	if !recovery.armed() {
 		t.Fatalf("messages recovery route should be armed")
+	}
+}
+
+func TestReadReplayInvalidResponseDetectsUnauthorizedAndRestoresBody(t *testing.T) {
+	body := `{"error":{"message":"input item does not belong to this connection"}}`
+	resp := &http.Response{
+		StatusCode: http.StatusUnauthorized,
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+
+	replayInvalid, detail := readReplayInvalidResponse(resp)
+	if !replayInvalid {
+		t.Fatalf("expected 401 replay-invalid body to be detected")
+	}
+	if detail != body {
+		t.Fatalf("detail = %q, want %q", detail, body)
+	}
+	restored, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll(restored body): %v", err)
+	}
+	if string(restored) != body {
+		t.Fatalf("body was not restored, got %q", string(restored))
+	}
+}
+
+func TestReadReplayInvalidResponseIgnoresPlainUnauthorized(t *testing.T) {
+	resp := &http.Response{
+		StatusCode: http.StatusUnauthorized,
+		Body:       io.NopCloser(strings.NewReader(`{"error":"token expired"}`)),
+	}
+
+	replayInvalid, _ := readReplayInvalidResponse(resp)
+	if replayInvalid {
+		t.Fatalf("plain 401 token failures must stay on the normal token refresh path")
 	}
 }
