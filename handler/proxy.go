@@ -503,6 +503,14 @@ func resolveState(c *gin.Context, exclude map[string]bool, requestedModel string
 		for accountID := range store.GetBlockedAccountIDs(requestedModel) {
 			combinedExclude[accountID] = true
 		}
+		if affinityKey, ok := c.Get("responsesSessionAffinityKey"); ok {
+			if key, _ := affinityKey.(string); key != "" {
+				if resolved := lookupResponsesSessionAffinity(key, requestedModel, combinedExclude); resolved != nil {
+					c.Set("responsesSessionAffinityStatus", "hit")
+					return resolved
+				}
+			}
+		}
 		account, err := instance.SelectAccount(strategy, combinedExclude)
 		if err != nil || account == nil {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "no available accounts in pool"})
@@ -512,6 +520,12 @@ func resolveState(c *gin.Context, exclude map[string]bool, requestedModel string
 		if state == nil {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "selected account instance not running"})
 			return nil
+		}
+		if affinityKey, ok := c.Get("responsesSessionAffinityKey"); ok {
+			if key, _ := affinityKey.(string); key != "" {
+				rememberResponsesSessionAffinity(key, account.ID)
+				c.Set("responsesSessionAffinityStatus", "bind")
+			}
 		}
 		return &resolvedAccount{State: state, AccountID: account.ID}
 	}
@@ -793,6 +807,12 @@ func proxyCompletions(c *gin.Context) {
 	}
 
 	requestedModel := extractRequestedModel(bodyBytes)
+	if isPool == true {
+		if key, source := responsesSessionAffinityKey(c, bodyBytes); key != "" {
+			c.Set("responsesSessionAffinityKey", key)
+			c.Set("responsesSessionAffinitySource", source)
+		}
+	}
 	previousResponseID := extractPreviousResponseID(bodyBytes)
 	exclude := make(map[string]bool)
 	for attempt := 0; attempt < maxAttempts; attempt++ {
@@ -1350,6 +1370,10 @@ func proxyResponses(c *gin.Context) {
 	if s, ok := c.Get("poolStrategy"); ok {
 		poolStrategy = s.(string)
 	}
+	affinitySource := ""
+	if s, ok := c.Get("responsesSessionAffinitySource"); ok {
+		affinitySource, _ = s.(string)
+	}
 	prevStickyReplay, prevStickyReplayOK := "", false
 	prevStickyTurn, prevStickyTurnOK := "", false
 	if previousResponseID != "" {
@@ -1360,9 +1384,8 @@ func proxyResponses(c *gin.Context) {
 	if len(functionCallOutputIDs) > 0 {
 		fcSticky, fcStickyOK = instance.LookupResponseFunctionCallAccount(functionCallOutputIDs)
 	}
-	log.Printf("[responses rid=%s] recv model=%q prev_id=%q fc_ids=%v pool=%v strategy=%q continuation=%v body_bytes=%d body_read_ms=%d prev_sticky_replay=%q(%v) prev_sticky_turn=%q(%v) fc_sticky=%q(%v)",
-		reqID, requestedModel, previousResponseID, functionCallOutputIDs, isPool == true, poolStrategy, continuationRequested,
-		len(bodyBytes), bodyReadMs,
+	log.Printf("[responses rid=%s] recv model=%q prev_id=%q fc_ids=%v pool=%v strategy=%q affinity_source=%q continuation=%v body_bytes=%d body_read_ms=%d prev_sticky_replay=%q(%v) prev_sticky_turn=%q(%v) fc_sticky=%q(%v)",
+		reqID, requestedModel, previousResponseID, functionCallOutputIDs, isPool == true, poolStrategy, affinitySource, continuationRequested, len(bodyBytes), bodyReadMs,
 		prevStickyReplay, prevStickyReplayOK, prevStickyTurn, prevStickyTurnOK, fcSticky, fcStickyOK)
 
 	// Strict per-session binding for continuation requests.
@@ -1513,8 +1536,15 @@ func proxyResponses(c *gin.Context) {
 			return
 		}
 
-		log.Printf("[responses rid=%s attempt=%d] resolved account=%s sticky_kind=%s fell_back=%v cross_rollover=%v exclude=%v recovery_route=%s recovery_from_account=%q recovery_to_account=%q recovery_reason=%q",
-			reqID, attempt, resolved.AccountID, stickyKind, fellBackToPool, crossAccountRollover, exclude,
+		affinityStatus := ""
+		if s, ok := c.Get("responsesSessionAffinityStatus"); ok {
+			affinityStatus, _ = s.(string)
+		}
+		if affinityStatus == "hit" && stickyKind == "fallback_round_robin" {
+			stickyKind = "session_affinity"
+		}
+		log.Printf("[responses rid=%s attempt=%d] resolved account=%s sticky_kind=%s fell_back=%v cross_rollover=%v session_affinity=%q exclude=%v recovery_route=%s recovery_from_account=%q recovery_to_account=%q recovery_reason=%q",
+			reqID, attempt, resolved.AccountID, stickyKind, fellBackToPool, crossAccountRollover, affinityStatus, exclude,
 			recovery.Route.logName(), recovery.FromAccount, resolved.AccountID, recovery.Reason)
 
 		if !checkRateLimit(c, resolved.AccountID) {

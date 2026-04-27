@@ -48,6 +48,48 @@ func TestContinuationDegradeOptIn(t *testing.T) {
 	}
 }
 
+func TestResponsesSessionAffinityKeyPrefersExplicitHeader(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Request.Header.Set("X-Copilot-Pool-Session", "session-header-123")
+
+	key, source := responsesSessionAffinityKey(c, []byte(`{"metadata":{"session_id":"session-body-123"}}`))
+	if key == "" {
+		t.Fatalf("expected affinity key from header")
+	}
+	if source != "X-Copilot-Pool-Session" {
+		t.Fatalf("source = %q, want X-Copilot-Pool-Session", source)
+	}
+	key2, _ := responsesSessionAffinityKey(c, []byte(`{"metadata":{"session_id":"session-body-123"}}`))
+	if key2 != key {
+		t.Fatalf("same session should hash to stable key")
+	}
+}
+
+func TestResponsesSessionAffinityKeyReadsMetadata(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+
+	key, source := responsesSessionAffinityKey(c, []byte(`{"metadata":{"conversation_id":"conv-123456789"}}`))
+	if key == "" {
+		t.Fatalf("expected affinity key from metadata")
+	}
+	if source != "metadata.conversation_id" {
+		t.Fatalf("source = %q, want metadata.conversation_id", source)
+	}
+}
+
+func TestResponsesSessionAffinityKeyIgnoresShortValues(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Request.Header.Set("X-Session-Id", "short")
+
+	key, source := responsesSessionAffinityKey(c, []byte(`{"metadata":{"session_id":"tiny"}}`))
+	if key != "" || source != "" {
+		t.Fatalf("short affinity values must be ignored, got key=%q source=%q", key, source)
+	}
+}
+
 // writeSessionBindingError shapes the three continuation-failure responses
 // that codex / pi clients will observe when strict binding rejects a
 // continuation. Verify status codes, the discriminating `type` field, and
