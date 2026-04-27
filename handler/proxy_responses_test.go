@@ -150,6 +150,27 @@ func TestResponsesRoutingTelemetryCountersAndRecentLimit(t *testing.T) {
 	}
 }
 
+func TestChoosePinnedResponsesAccountOrder(t *testing.T) {
+	oneShot := &resolvedAccount{AccountID: "acct-refresh"}
+	continuation := &resolvedAccount{AccountID: "acct-continuation"}
+	sameTurn := &resolvedAccount{AccountID: "acct-same-turn"}
+
+	resolved, sticky, usedOneShot := choosePinnedResponsesAccount(oneShot, continuation, sameTurn, "")
+	if resolved != oneShot || sticky != "pinned_retry" || !usedOneShot {
+		t.Fatalf("one-shot pin = (%v, %q, %v), want acct-refresh pinned_retry true", resolved, sticky, usedOneShot)
+	}
+
+	resolved, sticky, usedOneShot = choosePinnedResponsesAccount(nil, continuation, sameTurn, "")
+	if resolved != continuation || sticky != "session_binding_canonical" || usedOneShot {
+		t.Fatalf("continuation pin = (%v, %q, %v), want acct-continuation session_binding_canonical false", resolved, sticky, usedOneShot)
+	}
+
+	resolved, sticky, usedOneShot = choosePinnedResponsesAccount(nil, nil, sameTurn, "")
+	if resolved != sameTurn || sticky != "same_turn_pinned" || usedOneShot {
+		t.Fatalf("same-turn pin = (%v, %q, %v), want acct-same-turn same_turn_pinned false", resolved, sticky, usedOneShot)
+	}
+}
+
 // writeSessionBindingError shapes the three continuation-failure responses
 // that codex / pi clients will observe when strict binding rejects a
 // continuation. Verify status codes, the discriminating `type` field, and

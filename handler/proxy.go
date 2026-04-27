@@ -216,6 +216,22 @@ type resolvedAccount struct {
 	AccountID string
 }
 
+func choosePinnedResponsesAccount(pinnedAccount, continuationPinned, sameTurnPinned *resolvedAccount, pinnedKind string) (*resolvedAccount, string, bool) {
+	if pinnedAccount != nil {
+		if pinnedKind == "" {
+			pinnedKind = "pinned_retry"
+		}
+		return pinnedAccount, pinnedKind, true
+	}
+	if continuationPinned != nil {
+		return continuationPinned, "session_binding_canonical", false
+	}
+	if sameTurnPinned != nil {
+		return sameTurnPinned, "same_turn_pinned", false
+	}
+	return nil, "none", false
+}
+
 func extractRequestedModel(bodyBytes []byte) string {
 	if len(bodyBytes) == 0 {
 		return ""
@@ -1354,6 +1370,11 @@ func proxyResponses(c *gin.Context) {
 	// pinnedAccountKind keeping the log semantics explicit.
 	var pinnedAccount *resolvedAccount
 	pinnedAccountKind := ""
+	// sameTurnPinned makes the first resolved account immutable for the
+	// lifetime of this HTTP request. /v1/responses carries account-owned
+	// interaction and tool-call state; trying another pool account inside the
+	// same logical turn can double-spend the turn and still lose history.
+	var sameTurnPinned *resolvedAccount
 	// attemptLimit starts at maxAttempts. Each successful force-refresh that pins a retry
 	// grants one bonus slot so the pinned retry does not cannibalize the cross-account
 	// rollover budget. Without this, a pool where A orphan-degrades and B persistently
@@ -1554,17 +1575,16 @@ func proxyResponses(c *gin.Context) {
 	for attempt := 0; attempt < attemptLimit; attempt++ {
 		var resolved *resolvedAccount
 		stickyKind := "none"
-		if pinnedAccount != nil {
-			resolved = pinnedAccount
-			stickyKind = pinnedAccountKind
-			if stickyKind == "" {
-				stickyKind = "pinned_retry"
+		if chosen, kind, usedOneShot := choosePinnedResponsesAccount(pinnedAccount, continuationPinned, sameTurnPinned, pinnedAccountKind); chosen != nil {
+			resolved = chosen
+			stickyKind = kind
+			if usedOneShot {
+				pinnedAccount = nil
+				pinnedAccountKind = ""
 			}
-			pinnedAccount = nil
-			pinnedAccountKind = ""
-		} else if continuationPinned != nil {
-			resolved = continuationPinned
-			stickyKind = "session_binding_canonical"
+		}
+		if resolved != nil && sameTurnPinned != nil && resolved.AccountID == sameTurnPinned.AccountID {
+			crossAccountRollover = false
 		}
 		fellBackToPool := false
 		if resolved == nil {
@@ -1577,6 +1597,9 @@ func proxyResponses(c *gin.Context) {
 		if resolved == nil {
 			log.Printf("[responses rid=%s attempt=%d] resolve failed; error already written", reqID, attempt)
 			return
+		}
+		if sameTurnPinned == nil {
+			sameTurnPinned = resolved
 		}
 		if pendingSwitchFrom != "" {
 			kind := "account_switch_avoided"
@@ -1610,7 +1633,7 @@ func proxyResponses(c *gin.Context) {
 		if affinityStatus == "hit" && stickyKind == "fallback_round_robin" {
 			stickyKind = "session_affinity"
 		}
-		if affinityStatus == "bind" || affinityStatus == "hit" {
+		if (affinityStatus == "bind" || affinityStatus == "hit") && stickyKind != "same_turn_pinned" {
 			recordResponsesRoutingEvent(responsesRoutingTelemetryEvent{
 				Kind:          "session_affinity_" + affinityStatus,
 				RequestID:     reqID,
@@ -1693,7 +1716,7 @@ func proxyResponses(c *gin.Context) {
 					exclude[resolved.AccountID] = true
 					crossAccountRollover = true
 					recordSwitchTrigger(attempt, resolved.AccountID, "proxy_error_detached_continuation", 0, modeName)
-					log.Printf("[responses rid=%s attempt=%d] detached continuation failed on account=%s mode=%s, rolling over cross-account: %v", reqID, attempt, resolved.AccountID, modeName, proxyErr)
+					log.Printf("[responses rid=%s attempt=%d] detached continuation failed on account=%s mode=%s, retrying same turn account: %v", reqID, attempt, resolved.AccountID, modeName, proxyErr)
 					continue
 				}
 				if !continuationRequested {
@@ -1715,7 +1738,7 @@ func proxyResponses(c *gin.Context) {
 				exclude[resolved.AccountID] = true
 				crossAccountRollover = true
 				recordSwitchTrigger(attempt, resolved.AccountID, "replay_invalid_detached_continuation", resp.StatusCode, modeName)
-				log.Printf("[responses rid=%s attempt=%d] replay-invalid on account=%s mode=%s, rolling over cross-account; detail=%q",
+				log.Printf("[responses rid=%s attempt=%d] replay-invalid on account=%s mode=%s, retrying same turn account; detail=%q",
 					reqID, attempt, resolved.AccountID, modeName, truncateForLog(detail, 240))
 				continue
 			}
@@ -1796,7 +1819,7 @@ func proxyResponses(c *gin.Context) {
 			if recovery.armed() && isPool == true && attempt < attemptLimit-1 {
 				exclude[resolved.AccountID] = true
 				recordSwitchTrigger(attempt, resolved.AccountID, "recovery_replay_invalid", resp.StatusCode, modeName)
-				log.Printf("[responses rid=%s attempt=%d] replay-invalid during recovery route=%s account=%s, retrying different account; detail=%q",
+				log.Printf("[responses rid=%s attempt=%d] replay-invalid during recovery route=%s account=%s, retrying same turn account; detail=%q",
 					reqID, attempt, recovery.Route.logName(), resolved.AccountID, truncateForLog(detail, 240))
 				continue
 			}
@@ -1817,7 +1840,7 @@ func proxyResponses(c *gin.Context) {
 					exclude[resolved.AccountID] = true
 					crossAccountRollover = true
 					recordSwitchTrigger(attempt, resolved.AccountID, "account_disabled_detached_continuation", resp.StatusCode, modeName)
-					log.Printf("[responses rid=%s attempt=%d] disabled account=%s after detached continuation error (%s), rolling over cross-account", reqID, attempt, resolved.AccountID, reason)
+					log.Printf("[responses rid=%s attempt=%d] disabled account=%s after detached continuation error (%s), retrying same turn account", reqID, attempt, resolved.AccountID, reason)
 					continue
 				}
 				if !continuationRequested {
@@ -1832,10 +1855,8 @@ func proxyResponses(c *gin.Context) {
 		// 401 from a specific account is often a transient token-refresh-window race:
 		// the scheduled refresh hasn't completed yet, so the cached copilot token upstream
 		// rejects as expired. Force a refresh on this account and pin the next iteration
-		// to the same account so the refreshed token is actually exercised — otherwise the
-		// next iteration's resolveState may pick a different pool account and waste the
-		// refresh. If the pinned retry also 401s, refreshedOnAccount guards this block
-		// and we fall through to isRetryableStatus for cross-account rollover.
+		// to the same account so the refreshed token is actually exercised. Responses
+		// same-turn routing must not move this request to a different pool account.
 		if resp.StatusCode == http.StatusUnauthorized && !refreshedOnAccount[resolved.AccountID] && attempt < attemptLimit-1 {
 			instance.RecordRequest(resolved.AccountID, true, false)
 			if orphanDegraded {
@@ -1845,7 +1866,7 @@ func proxyResponses(c *gin.Context) {
 			_ = resp.Body.Close()
 			refreshedOnAccount[resolved.AccountID] = true
 			if refreshErr := instance.ForceRefreshToken(resolved.AccountID); refreshErr != nil {
-				log.Printf("[responses rid=%s attempt=%d] 401 on account=%s: token refresh failed (%v), falling back to cross-account retry", reqID, attempt, resolved.AccountID, refreshErr)
+				log.Printf("[responses rid=%s attempt=%d] 401 on account=%s: token refresh failed (%v), retrying same turn account", reqID, attempt, resolved.AccountID, refreshErr)
 				exclude[resolved.AccountID] = true
 				recordSwitchTrigger(attempt, resolved.AccountID, "token_refresh_failed", resp.StatusCode, modeName)
 				if continuationRequested && continuationCanDetach && isPool == true {
@@ -1872,13 +1893,13 @@ func proxyResponses(c *gin.Context) {
 				exclude[resolved.AccountID] = true
 				crossAccountRollover = true
 				recordSwitchTrigger(attempt, resolved.AccountID, "retryable_status_detached_continuation", resp.StatusCode, modeName)
-				log.Printf("[responses rid=%s attempt=%d] upstream %d on account=%s mode=%s, rolling over cross-account", reqID, attempt, resp.StatusCode, resolved.AccountID, modeName)
+				log.Printf("[responses rid=%s attempt=%d] upstream %d on account=%s mode=%s, retrying same turn account", reqID, attempt, resp.StatusCode, resolved.AccountID, modeName)
 				continue
 			}
 			if !continuationRequested {
 				exclude[resolved.AccountID] = true
 				recordSwitchTrigger(attempt, resolved.AccountID, "retryable_status_non_continuation", resp.StatusCode, modeName)
-				log.Printf("[responses rid=%s attempt=%d] upstream %d on account=%s, retrying with different account", reqID, attempt, resp.StatusCode, resolved.AccountID)
+				log.Printf("[responses rid=%s attempt=%d] upstream %d on account=%s, retrying same turn account", reqID, attempt, resp.StatusCode, resolved.AccountID)
 				continue
 			}
 		}
