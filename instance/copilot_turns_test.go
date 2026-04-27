@@ -383,6 +383,166 @@ func TestDoMessagesProxyEmitsToolContinuationHeaders(t *testing.T) {
 	}
 }
 
+func TestDoMessagesProxyViaWorkerForwardsAnthropicPayloadAndHeaders(t *testing.T) {
+	resetCopilotTurnCaches()
+	gin.SetMode(gin.TestMode)
+	setupWorkerStoreEnv(t)
+
+	account, err := store.AddAccount("demo-messages", "gh-token", "individual")
+	if err != nil {
+		t.Fatalf("AddAccount: %v", err)
+	}
+	if _, err := store.UpdateAccount(account.ID, map[string]interface{}{"workerUrl": "http://worker.local"}); err != nil {
+		t.Fatalf("UpdateAccount workerUrl: %v", err)
+	}
+
+	ctx := newCopilotTurnContext()
+	storeMessageToolCallTurnContext(account.ID, []string{"call_1"}, ctx)
+
+	var gotReq *http.Request
+	var gotBody []byte
+	withWorkerClient(t, &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		gotReq = req.Clone(req.Context())
+		gotBody, _ = io.ReadAll(req.Body)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header: http.Header{
+				"Content-Type": []string{"application/json"},
+			},
+			Body: io.NopCloser(strings.NewReader(`{"id":"msg-worker","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4.5","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}`)),
+		}, nil
+	})})
+
+	payload := anthropic.AnthropicMessagesPayload{
+		Model:     "claude-sonnet-4-5",
+		MaxTokens: 64,
+		Messages: []anthropic.AnthropicMessage{
+			{Role: "assistant", Content: []anthropic.ContentBlock{{Type: "tool_use", ID: "call_1", Name: "shell"}}},
+			{Role: "user", Content: []anthropic.ContentBlock{{Type: "tool_result", ToolUseID: "call_1", Content2: "ok"}}},
+		},
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("failed to marshal payload: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	c.Request.Header.Set("X-Trace-Id", "trace-msg-worker-1")
+
+	resp, turnRequest, err := DoMessagesProxy(c, account.ID, testState(), body)
+	if err != nil {
+		t.Fatalf("DoMessagesProxy returned error: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if gotReq == nil {
+		t.Fatal("expected worker request to be captured")
+	}
+	if gotReq.URL.Path != "/v1/messages" {
+		t.Fatalf("expected /v1/messages path, got %s", gotReq.URL.Path)
+	}
+	if turnRequest.Context != ctx {
+		t.Fatalf("expected stored context %+v, got %+v", ctx, turnRequest.Context)
+	}
+	assertHeaderValue(t, gotReq.Header, "X-Initiator", "agent")
+	assertHeaderValue(t, gotReq.Header, "X-Interaction-Type", copilotInteractionTypeAgent)
+	assertHeaderValue(t, gotReq.Header, "X-Interaction-Id", ctx.InteractionID)
+	assertHeaderValue(t, gotReq.Header, "X-Client-Session-Id", ctx.ClientSessionID)
+	assertHeaderValue(t, gotReq.Header, "X-Agent-Task-Id", ctx.AgentTaskID)
+	assertHeaderValue(t, gotReq.Header, "X-Trace-Id", "trace-msg-worker-1")
+	if !bytes.Contains(gotBody, []byte(`"tool_use_id":"call_1"`)) {
+		t.Fatalf("expected worker payload to preserve Anthropic tool_result linkage, got %s", string(gotBody))
+	}
+	if bytes.Contains(gotBody, []byte(`"tool_call_id":"call_1"`)) {
+		t.Fatalf("did not expect OpenAI chat payload on worker /v1/messages, got %s", string(gotBody))
+	}
+	if got := resp.Header.Get(internalMessagesResponseFormatHeader); got != internalMessagesResponseFormatAnthropic {
+		t.Fatalf("expected internal response format header %q, got %q", internalMessagesResponseFormatAnthropic, got)
+	}
+}
+
+func TestForwardMessagesResponseWorkerAnthropicNonStreamStoresToolCallIDs(t *testing.T) {
+	resetCopilotTurnCaches()
+	gin.SetMode(gin.TestMode)
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header: http.Header{
+			"Content-Type":                       []string{"application/json"},
+			internalMessagesResponseFormatHeader: []string{internalMessagesResponseFormatAnthropic},
+		},
+		Body: io.NopCloser(strings.NewReader(`{"id":"msg-1","type":"message","role":"assistant","content":[{"type":"tool_use","id":"tool_1","name":"shell","input":{"cmd":"pwd"}}],"model":"claude-sonnet-4.5","stop_reason":"tool_use","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}`)),
+	}
+	turnRequest := newCopilotTurnRequest(copilotInteractionTypeAgent)
+	originalBody := []byte(`{"model":"claude-sonnet-4-5","max_tokens":64,"messages":[{"role":"user","content":"hi"}],"stream":false}`)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+
+	ForwardMessagesResponse(c, "acct-1", turnRequest, resp, originalBody)
+
+	if accountID, ok := LookupMessageToolCallAccount([]string{"tool_1"}); !ok || accountID != "acct-1" {
+		t.Fatalf("expected worker anthropic response to populate tool cache for acct-1, got %q ok=%v", accountID, ok)
+	}
+	if got := w.Code; got != http.StatusOK {
+		t.Fatalf("status=%d, want 200", got)
+	}
+	if !bytes.Contains(w.Body.Bytes(), []byte(`"tool_use"`)) {
+		t.Fatalf("expected anthropic response passthrough, got %s", w.Body.String())
+	}
+}
+
+func TestForwardMessagesResponseWorkerAnthropicStreamStoresToolCallIDs(t *testing.T) {
+	resetCopilotTurnCaches()
+	gin.SetMode(gin.TestMode)
+
+	sse := strings.Join([]string{
+		"event: message_start",
+		"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4.5\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}",
+		"",
+		"event: content_block_start",
+		"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_stream_1\",\"name\":\"shell\"}}",
+		"",
+		"event: content_block_delta",
+		"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}",
+		"",
+		"event: content_block_stop",
+		"data: {\"type\":\"content_block_stop\",\"index\":0}",
+		"",
+		"event: message_delta",
+		"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":1}}",
+		"",
+		"event: message_stop",
+		"data: {\"type\":\"message_stop\"}",
+		"",
+	}, "\n")
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header: http.Header{
+			"Content-Type":                       []string{"text/event-stream"},
+			internalMessagesResponseFormatHeader: []string{internalMessagesResponseFormatAnthropic},
+		},
+		Body: io.NopCloser(strings.NewReader(sse)),
+	}
+	turnRequest := newCopilotTurnRequest(copilotInteractionTypeAgent)
+	originalBody := []byte(`{"model":"claude-sonnet-4-5","max_tokens":64,"messages":[{"role":"user","content":"hi"}],"stream":true}`)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+
+	ForwardMessagesResponse(c, "acct-1", turnRequest, resp, originalBody)
+
+	if accountID, ok := LookupMessageToolCallAccount([]string{"tool_stream_1"}); !ok || accountID != "acct-1" {
+		t.Fatalf("expected worker anthropic stream to populate tool cache for acct-1, got %q ok=%v", accountID, ok)
+	}
+	if !strings.Contains(w.Body.String(), "event: content_block_start") || !strings.Contains(w.Body.String(), "tool_stream_1") {
+		t.Fatalf("expected anthropic SSE passthrough, got %s", w.Body.String())
+	}
+}
+
 func TestDoMessagesProxyUsesMaxCompletionTokensForGpt5(t *testing.T) {
 	resetCopilotTurnCaches()
 	gin.SetMode(gin.TestMode)

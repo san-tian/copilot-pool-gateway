@@ -2,6 +2,7 @@ package instance
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,6 +17,11 @@ import (
 	"copilot-go/store"
 
 	"github.com/gin-gonic/gin"
+)
+
+const (
+	internalMessagesResponseFormatHeader    = "X-Copilot-Go-Internal-Messages-Format"
+	internalMessagesResponseFormatAnthropic = "anthropic"
 )
 
 // DoCompletionsProxy performs the upstream request for completions and returns the raw response.
@@ -175,12 +181,43 @@ func doMessagesProxy(c *gin.Context, accountID string, state *config.State, body
 		return nil, copilotTurnRequest{}, err
 	}
 
-	// Auto-fill max_tokens from model capabilities if not provided
+	// Auto-fill max_tokens from model capabilities if not provided.
+	// Keep this at the gateway layer for both direct and worker-backed /v1/messages
+	// so older clients still get the same max_tokens behavior after worker routing.
 	if anthropicPayload.MaxTokens == 0 {
 		copilotModelID := anthropic.NormalizeAnthropicModel(store.ToCopilotID(anthropicPayload.Model))
 		if limit := lookupMaxOutputTokens(state, copilotModelID); limit > 0 {
 			anthropicPayload.MaxTokens = limit
 		}
+	}
+
+	turnRequest := buildMessagesTurnRequest(accountID, anthropicPayload)
+	if detached {
+		turnRequest = newCopilotTurnRequest(copilotInteractionTypeUser)
+	}
+
+	workerURL := ""
+	if config.WorkerPoolMode() != "off" {
+		if acct, _ := store.GetAccount(accountID); acct != nil {
+			workerURL = strings.TrimSpace(acct.WorkerURL)
+		}
+	}
+	if workerURL != "" {
+		workerBody, err := json.Marshal(anthropicPayload)
+		if err != nil {
+			return nil, copilotTurnRequest{}, fmt.Errorf("failed to marshal worker messages request: %v", err)
+		}
+		traceID := strings.TrimSpace(c.GetHeader("X-Trace-Id"))
+		start := time.Now()
+		resp, proxyErr := ProxyRequestViaWorker(context.Background(), workerURL, "POST", "/v1/messages", workerBody, turnRequest.Headers(), traceID)
+		statusCode := 0
+		if resp != nil {
+			statusCode = resp.StatusCode
+			resp.Header.Set(internalMessagesResponseFormatHeader, internalMessagesResponseFormatAnthropic)
+		}
+		log.Printf("[messages account=%s trace=%s] worker=%s worker_ms=%d status=%d err=%v",
+			accountID, traceID, workerURL, time.Since(start).Milliseconds(), statusCode, proxyErr)
+		return resp, turnRequest, proxyErr
 	}
 
 	hasVision := checkVisionContent(anthropicPayload)
@@ -193,11 +230,6 @@ func doMessagesProxy(c *gin.Context, accountID string, state *config.State, body
 	openaiBytes, _, hasVision, err = normalizeCompletionsPayload(state, openaiBytes)
 	if err != nil {
 		return nil, copilotTurnRequest{}, err
-	}
-
-	turnRequest := buildMessagesTurnRequest(accountID, anthropicPayload)
-	if detached {
-		turnRequest = newCopilotTurnRequest(copilotInteractionTypeUser)
 	}
 
 	resp, proxyErr := ProxyRequestWithBytesCtx(c.Request.Context(), state, "POST", "/chat/completions", openaiBytes, turnRequest.Headers(), hasVision)
@@ -216,10 +248,126 @@ func ForwardMessagesResponse(c *gin.Context, accountID string, turnRequest copil
 		return
 	}
 
+	if resp.Header.Get(internalMessagesResponseFormatHeader) == internalMessagesResponseFormatAnthropic {
+		if anthropicPayload.Stream {
+			handleAnthropicWorkerStream(c, accountID, turnRequest, resp)
+		} else {
+			handleAnthropicWorkerNonStream(c, accountID, turnRequest, resp)
+		}
+		return
+	}
+
 	if anthropicPayload.Stream {
 		handleAnthropicStream(c, accountID, turnRequest, resp)
 	} else {
 		handleAnthropicNonStream(c, accountID, turnRequest, resp)
+	}
+}
+
+func collectAnthropicToolUseIDsFromResponse(resp anthropic.AnthropicResponse) []string {
+	ids := make([]string, 0)
+	for _, block := range resp.Content {
+		if block.Type != "tool_use" {
+			continue
+		}
+		if toolUseID := strings.TrimSpace(block.ID); toolUseID != "" {
+			ids = append(ids, toolUseID)
+		}
+	}
+	return uniqueTrimmed(ids)
+}
+
+func handleAnthropicWorkerNonStream(c *gin.Context, accountID string, turnRequest copilotTurnRequest, resp *http.Response) {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read response"})
+		return
+	}
+
+	contentType := resp.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = "application/json"
+	}
+	if resp.StatusCode != http.StatusOK {
+		c.Data(resp.StatusCode, contentType, body)
+		return
+	}
+
+	var anthropicResp anthropic.AnthropicResponse
+	if err := json.Unmarshal(body, &anthropicResp); err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to parse upstream response"})
+		return
+	}
+
+	storeMessageToolCallTurnContext(accountID, collectAnthropicToolUseIDsFromResponse(anthropicResp), turnRequest.Context)
+	c.Data(http.StatusOK, contentType, body)
+}
+
+func handleAnthropicWorkerStream(c *gin.Context, accountID string, turnRequest copilotTurnRequest, resp *http.Response) {
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		contentType := resp.Header.Get("Content-Type")
+		if contentType == "" {
+			contentType = "application/json"
+		}
+		c.Data(resp.StatusCode, contentType, body)
+		return
+	}
+
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "close")
+	c.Request.Close = true
+	c.Header("X-Accel-Buffering", "no")
+	c.Header("Transfer-Encoding", "chunked")
+	c.Status(http.StatusOK)
+
+	w := c.Writer
+	flusher, hasFlusher := w.(http.Flusher)
+	clientGone := c.Request.Context().Done()
+	toolUseIDs := make([]string, 0)
+	currentEvent := ""
+
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 10*1024*1024), 10*1024*1024)
+	for scanner.Scan() {
+		select {
+		case <-clientGone:
+			log.Printf("[Stream] Client disconnected, stopping stream")
+			return
+		default:
+		}
+
+		line := scanner.Text()
+		if strings.HasPrefix(line, "event: ") {
+			currentEvent = strings.TrimSpace(strings.TrimPrefix(line, "event: "))
+		} else if strings.HasPrefix(line, "data: ") && currentEvent == "content_block_start" {
+			data := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
+			if data != "" && data != "[DONE]" {
+				var event anthropic.ContentBlockStartEvent
+				if err := json.Unmarshal([]byte(data), &event); err == nil && event.ContentBlock.Type == "tool_use" {
+					if toolUseID := strings.TrimSpace(event.ContentBlock.ID); toolUseID != "" {
+						toolUseIDs = append(toolUseIDs, toolUseID)
+					}
+				}
+			}
+		}
+
+		if _, err := io.WriteString(w, line+"\n"); err != nil {
+			log.Printf("[Stream] Write error: %v", err)
+			return
+		}
+		if line == "" && hasFlusher {
+			flusher.Flush()
+		}
+	}
+
+	storeMessageToolCallTurnContext(accountID, uniqueTrimmed(toolUseIDs), turnRequest.Context)
+	if err := scanner.Err(); err != nil {
+		log.Printf("[Stream] Scanner error: %v", err)
+	}
+	if hasFlusher {
+		flusher.Flush()
 	}
 }
 
